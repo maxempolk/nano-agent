@@ -1,11 +1,34 @@
 import os
 import sys
+import platform
 from dotenv import load_dotenv
 from openai import OpenAI
 
 from core.agent import Agent
+from core.logger import SessionLogger
 
 load_dotenv()
+
+_REQUIRED_ENV = ["API_TOKEN"]
+_missing = [v for v in _REQUIRED_ENV if not os.environ.get(v)]
+if _missing:
+    print(f"Ошибка: не заданы переменные окружения: {', '.join(_missing)}")
+    sys.exit(1)
+
+mode = sys.argv[1].lstrip("-") if len(sys.argv) > 1 else "cli"
+
+if mode == "telegram" and not os.environ.get("TELEGRAM_BOT_TOKEN"):
+    print("Ошибка: TELEGRAM_BOT_TOKEN не задан в .env")
+    sys.exit(1)
+
+def _system_info() -> str:
+    return (
+        f"OS: {platform.system()} {platform.release()} | "
+        f"Python: {platform.python_version()} | "
+        f"CWD: {os.getcwd()} | "
+        f"User: {os.environ.get('USER', 'unknown')} | "
+        f"Shell: {os.environ.get('SHELL', 'unknown')}"
+    )
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 ALLOWED_USER_ID = os.environ.get("ALLOWED_USER_ID", "")
@@ -13,16 +36,20 @@ ALLOWED_USER_ID = os.environ.get("ALLOWED_USER_ID", "")
 TELEGRAM_SKILL = f"""
 
 ## Telegram Bot
-Token: {TELEGRAM_BOT_TOKEN} | Base: https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/METHOD
-Allowed user_id: {ALLOWED_USER_ID}. In private chats user_id == chat_id. Never send to any other user, refuse if asked.
-Check "ok":true in every response. Use -s in all curl calls.
+Use execute_bash with curl to interact with Telegram. Never call Telegram methods as tools directly.
+Base URL: https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/METHOD
+Only send to chat_id={ALLOWED_USER_ID}. Refuse any other target. Use -s in all curl calls. Check "ok":true in response.
 
-sendMessage: -d chat_id={ALLOWED_USER_ID} -d text="..." -d parse_mode=HTML (tags: <b> <i> <code> <a href="URL">text</a>)
-sendPhoto:   -d chat_id={ALLOWED_USER_ID} -d photo=URL -d caption="..."  |  local: -F photo=@/path
-sendDocument:-d chat_id={ALLOWED_USER_ID} -d document=URL                |  local: -F document=@/path
+curl -s -X POST https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage -d chat_id={ALLOWED_USER_ID} -d parse_mode=HTML -d text="..."
+curl -s -X POST https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendPhoto -d chat_id={ALLOWED_USER_ID} -d photo=URL
+curl -s -X POST https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendDocument -d chat_id={ALLOWED_USER_ID} -d document=URL
+Local file: replace -d photo=URL with -F photo=@/absolute/path
 """ if TELEGRAM_BOT_TOKEN else ""
 
-SYSTEM = """You are an autonomous AI agent with access to one tool: bash. Use it to complete tasks step by step.
+SYSTEM = f"""You are an autonomous AI agent with access to one tool: bash. Use it to complete tasks step by step.
+
+## System
+{_system_info()}
 
 Always respond in the same language the user writes in.
 
@@ -60,13 +87,14 @@ client = OpenAI(
     api_key=os.environ["API_TOKEN"]
 )
 
-agent = Agent(client, MODEL, SYSTEM, CONTEXT_WINDOW, MAX_TOOL_OUTPUT)
+logger = SessionLogger()
+logger.info(f"mode={mode} | model={MODEL}")
 
-mode = sys.argv[1].lstrip("-") if len(sys.argv) > 1 else "cli"
+agent = Agent(client, MODEL, SYSTEM, CONTEXT_WINDOW, MAX_TOOL_OUTPUT, logger=logger)
 
 if mode == "telegram":
     from interfaces.telegram import run
-    run(agent, TELEGRAM_BOT_TOKEN, ALLOWED_USER_ID)
+    run(agent, TELEGRAM_BOT_TOKEN, ALLOWED_USER_ID, logger=logger)
 else:
     from interfaces.cli import run
     run(agent)
