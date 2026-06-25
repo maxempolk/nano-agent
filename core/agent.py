@@ -1,5 +1,5 @@
 from __future__ import annotations
-from openai import OpenAI
+from openai import OpenAI, BadRequestError
 from typing import TYPE_CHECKING
 import json
 import subprocess
@@ -75,6 +75,15 @@ class Agent:
                     tools=TOOLS,        # type: ignore
                     tool_choice="auto"
                 )
+            except BadRequestError as e:
+                if "tool_use_failed" in str(e):
+                    # Модель сгенерировала невалидный tool call — повтор без инструментов
+                    response = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=windowed,  # type: ignore
+                    )
+                else:
+                    raise
             except Exception as e:
                 error_reply = f"Ошибка API: {e}"
                 if self.logger:
