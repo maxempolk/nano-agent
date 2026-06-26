@@ -29,6 +29,17 @@ class WebSearchTool:
         self.client = client
         self.model = model
 
+    def _optimize_query(self, query: str) -> str:
+        response = self.client.chat.completions.create(
+            model=self.model,
+            messages=[{"role": "user", "content":
+                f"Convert to a short English search engine query (3-6 keywords, no punctuation).\n"
+                f"Reply with ONLY the query in English, nothing else.\n"
+                f"Input: {query}"
+            }]
+        )
+        return response.choices[0].message.content.strip() or query
+
     def _format_results(self, results: list[dict]) -> str:
         rows = ""
         for i, r in enumerate(results):
@@ -78,17 +89,21 @@ class WebSearchTool:
             return f"Ошибка парсинга: {e}"
 
     def execute(self, query: str) -> str:
-        # 1. Поиск
+        # 1. Оптимизируем запрос
+        self.last_query = self._optimize_query(query)
+        query = self.last_query
+
+        # 2. Поиск
         with DDGS() as ddg:
             results = ddg.text(query, max_results=MAX_RESULTS)
         if not results:
             return "Ничего не найдено."
 
-        # 2. Форматируем и выбираем релевантные
+        # 3. Форматируем и выбираем релевантные
         formatted = self._format_results(results)
         indices = self._pick_relevant(formatted, results)
 
-        # 3. Парсим выбранные сайты
+        # 4. Парсим выбранные сайты
         parts = []
         for i in indices:
             url = results[i]["href"]

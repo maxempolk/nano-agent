@@ -32,16 +32,19 @@ class Agent:
 
         self.tools = [bash.SCHEMA]
         self.handlers: dict = {"execute_bash": bash.execute}
+        self.tool_objects: dict = {}
         for tool in (extra_tools or []):
             self.tools.append(tool.SCHEMA)  # type: ignore
             name = tool.SCHEMA["function"]["name"]  # type: ignore
             self.handlers[name] = tool.execute
+            self.tool_objects[name] = tool
 
     def run_turn(self, user_input: str, on_tool_call=None) -> str:
         self.messages.append({"role": "user", "content": user_input})
         if self.logger:
             self.logger.user(user_input)
 
+        self.last_search_query: str | None = None
         tool_calls_made = 0
 
         while True:
@@ -88,6 +91,10 @@ class Agent:
                         result = f"Неизвестный инструмент: {call.function.name}"
                     else:
                         result = _truncate(handler(**args), self.max_tool_output)
+
+                    if call.function.name == "web_search":
+                        tool_obj = self.tool_objects.get("web_search")
+                        self.last_search_query = getattr(tool_obj, "last_query", args.get("query"))
 
                     if self.logger:
                         self.logger.tool_call(call.function.name, call.function.arguments)

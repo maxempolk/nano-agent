@@ -7,6 +7,8 @@ from openai import OpenAI
 from core.agent import Agent
 from core.logger import SessionLogger
 from core.tools.web_search import WebSearchTool
+from core.tools import cron as cron_tool
+from core.cron_runner import CronRunner
 
 load_dotenv()
 
@@ -75,6 +77,9 @@ Always respond in the same language the user writes in.
 - More than 20 bash calls without completing the task: check in with user.
 - When unsure if a command is safe: ask, don't run.
 
+## Tools
+Use web_search ONLY when the query explicitly requires current or real-time information (news, prices, live data). Do not search for things you already know.
+
 ## Output
 Be concise. No explanations unless asked. No confirmations like "Sure!" or "I'll do that now.".
 Report errors and results only. Skip filler.""" + TELEGRAM_SKILL
@@ -92,7 +97,26 @@ logger = SessionLogger()
 logger.info(f"mode={mode} | model={MODEL}")
 
 web_search = WebSearchTool(client, MODEL)
-agent = Agent(client, MODEL, SYSTEM, CONTEXT_WINDOW, MAX_TOOL_OUTPUT, logger=logger, extra_tools=[web_search])
+
+class CronToolWrapper:
+    SCHEMA = cron_tool.SCHEMA
+    def execute(self, **kwargs): return cron_tool.execute(**kwargs)
+
+cron_wrapper = CronToolWrapper()
+
+CRON_SKILL = "\nUse cron_manage to add, list or remove scheduled tasks. Schedule format: cron expression \"minute hour day month weekday\"."
+
+# Фабрика для крон-задач — без cron_manage, чтобы задачи не могли создавать задачи рекурсивно
+def cron_agent_factory():
+    return Agent(client, MODEL, SYSTEM, CONTEXT_WINDOW, MAX_TOOL_OUTPUT,
+                 extra_tools=[web_search])
+
+agent = Agent(client, MODEL, SYSTEM + CRON_SKILL, CONTEXT_WINDOW, MAX_TOOL_OUTPUT,
+              logger=logger, extra_tools=[web_search, cron_wrapper])
+
+if TELEGRAM_BOT_TOKEN and ALLOWED_USER_ID:
+    cron_runner = CronRunner(cron_agent_factory, TELEGRAM_BOT_TOKEN, ALLOWED_USER_ID)
+    cron_runner.start()
 
 if mode == "telegram":
     from interfaces.telegram import run

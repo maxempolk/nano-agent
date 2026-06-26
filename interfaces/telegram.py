@@ -1,6 +1,7 @@
 from __future__ import annotations
 import time
 import httpx
+from urllib.parse import quote_plus
 from core.agent import Agent
 from core.logger import SessionLogger
 
@@ -58,6 +59,9 @@ def run(agent: Agent, token: str, allowed_user_id: str, logger: SessionLogger | 
 
             try:
                 reply = agent.run_turn(text)
+                if agent.last_search_query:
+                    url = f"https://duckduckgo.com/?q={quote_plus(agent.last_search_query)}"
+                    reply += f'\n\n<i>🔍 <a href="{url}">{agent.last_search_query}</a></i>'
             except Exception as e:
                 reply = f"Внутренняя ошибка агента: {e}"
                 if logger:
