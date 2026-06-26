@@ -1,5 +1,9 @@
 # Project Rules
 
+## Git workflow
+- Remind the user to commit after every significant feature or fix. Do NOT commit automatically.
+- Wait for the user to explicitly say "сделай коммит" before committing.
+
 ## Token Economy (top priority)
 - Keep system prompts as short as possible. Every word costs tokens.
 - Skills injected into the system prompt must be dense — no examples, no repeating what the model already knows, no filler.

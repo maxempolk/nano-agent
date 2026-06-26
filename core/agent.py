@@ -2,41 +2,19 @@ from __future__ import annotations
 from openai import OpenAI, BadRequestError
 from typing import TYPE_CHECKING
 import json
-import subprocess
+
+from core.tools import bash
 
 if TYPE_CHECKING:
     from core.logger import SessionLogger
 
-TOOLS = [
-    {
-        "type": "function",
-        "function": {
-            "name": "execute_bash",
-            "description": "Execute a bash command.",
-            "parameters": {
-                "type": "object",
-                "properties": {
-                    "command": {"type": "string"}
-                },
-                "required": ["command"]
-            }
-        }
-    }
-]
+TOOLS = [bash.SCHEMA]
 
 MAX_TOOL_CALLS_PER_TURN = 20
 
-
-def _execute_bash(command: str) -> str:
-    try:
-        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=30)
-        if result.returncode == 0:
-            return result.stdout or "Выполнено успешно (нет вывода)"
-        return f"Ошибка (код {result.returncode}):\n{result.stderr}"
-    except subprocess.TimeoutExpired:
-        return "Ошибка: превышен таймаут 30 секунд"
-    except Exception as e:
-        return f"Ошибка: {str(e)}"
+TOOL_HANDLERS = {
+    "execute_bash": bash.execute,
+}
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -77,7 +55,6 @@ class Agent:
                 )
             except BadRequestError as e:
                 if "tool_use_failed" in str(e):
-                    # Модель сгенерировала невалидный tool call — повтор без инструментов
                     response = self.client.chat.completions.create(
                         model=self.model,
                         messages=windowed,  # type: ignore
@@ -104,13 +81,18 @@ class Agent:
                 self.messages.append(message)  # type: ignore
                 for call in message.tool_calls:
                     args = json.loads(call.function.arguments)  # type: ignore
+                    handler = TOOL_HANDLERS.get(call.function.name)
+                    if not handler:
+                        result = f"Неизвестный инструмент: {call.function.name}"
+                    else:
+                        result = _truncate(handler(**args), self.max_tool_output)
+
                     if self.logger:
                         self.logger.tool_call(call.function.name, call.function.arguments)
-                    result = _truncate(_execute_bash(**args), self.max_tool_output)
-                    if self.logger:
                         self.logger.tool_result(result)
                     if on_tool_call:
                         on_tool_call(call.function.name, call.function.arguments, result)
+
                     self.messages.append({
                         "role": "tool",
                         "tool_call_id": call.id,
