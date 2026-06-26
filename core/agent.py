@@ -8,13 +8,7 @@ from core.tools import bash
 if TYPE_CHECKING:
     from core.logger import SessionLogger
 
-TOOLS = [bash.SCHEMA]
-
 MAX_TOOL_CALLS_PER_TURN = 20
-
-TOOL_HANDLERS = {
-    "execute_bash": bash.execute,
-}
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -27,13 +21,21 @@ def _truncate(text: str, max_chars: int) -> str:
 class Agent:
     def __init__(self, client: OpenAI, model: str, system: str,
                  context_window: int = 10, max_tool_output: int = 2000,
-                 logger: SessionLogger | None = None):
+                 logger: SessionLogger | None = None,
+                 extra_tools: list | None = None):
         self.client = client
         self.model = model
         self.context_window = context_window
         self.max_tool_output = max_tool_output
         self.logger = logger
         self.messages: list = [{"role": "system", "content": system}]
+
+        self.tools = [bash.SCHEMA]
+        self.handlers: dict = {"execute_bash": bash.execute}
+        for tool in (extra_tools or []):
+            self.tools.append(tool.SCHEMA)  # type: ignore
+            name = tool.SCHEMA["function"]["name"]  # type: ignore
+            self.handlers[name] = tool.execute
 
     def run_turn(self, user_input: str, on_tool_call=None) -> str:
         self.messages.append({"role": "user", "content": user_input})
@@ -49,8 +51,8 @@ class Agent:
             try:
                 response = self.client.chat.completions.create(
                     model=self.model,
-                    messages=windowed,  # type: ignore
-                    tools=TOOLS,        # type: ignore
+                    messages=windowed,        # type: ignore
+                    tools=self.tools,         # type: ignore
                     tool_choice="auto"
                 )
             except BadRequestError as e:
@@ -81,7 +83,7 @@ class Agent:
                 self.messages.append(message)  # type: ignore
                 for call in message.tool_calls:
                     args = json.loads(call.function.arguments)  # type: ignore
-                    handler = TOOL_HANDLERS.get(call.function.name)
+                    handler = self.handlers.get(call.function.name)
                     if not handler:
                         result = f"Неизвестный инструмент: {call.function.name}"
                     else:

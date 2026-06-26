@@ -6,6 +6,7 @@ from openai import OpenAI
 
 from core.agent import Agent
 from core.logger import SessionLogger
+from core.tools.web_search import WebSearchTool
 
 load_dotenv()
 
@@ -90,7 +91,8 @@ client = OpenAI(
 logger = SessionLogger()
 logger.info(f"mode={mode} | model={MODEL}")
 
-agent = Agent(client, MODEL, SYSTEM, CONTEXT_WINDOW, MAX_TOOL_OUTPUT, logger=logger)
+web_search = WebSearchTool(client, MODEL)
+agent = Agent(client, MODEL, SYSTEM, CONTEXT_WINDOW, MAX_TOOL_OUTPUT, logger=logger, extra_tools=[web_search])
 
 if mode == "telegram":
     from interfaces.telegram import run
