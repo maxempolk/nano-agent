@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING
 import json
 
 from core.tools import bash
+from core.llm import call_llm
 
 if TYPE_CHECKING:
     from core.logger import SessionLogger
@@ -52,18 +53,10 @@ class Agent:
             windowed = [self.messages[0]] + history[-self.context_window:]
 
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=windowed,        # type: ignore
-                    tools=self.tools,         # type: ignore
-                    tool_choice="auto"
-                )
+                response = call_llm(self.client, self.model, windowed, self.tools)  # type: ignore
             except BadRequestError as e:
                 if "tool_use_failed" in str(e):
-                    response = self.client.chat.completions.create(
-                        model=self.model,
-                        messages=windowed,  # type: ignore
-                    )
+                    response = call_llm(self.client, self.model, windowed)  # type: ignore
                 else:
                     raise
             except Exception as e:

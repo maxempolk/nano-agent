@@ -2,6 +2,8 @@ import trafilatura
 from ddgs import DDGS
 from openai import OpenAI
 
+from core.llm import call_llm
+
 MAX_RESULTS = 10
 MAX_SCRAPE = 3
 MAX_CONTENT_CHARS = 2000
@@ -25,19 +27,17 @@ SCHEMA = {
 class WebSearchTool:
     SCHEMA = SCHEMA
 
-    def __init__(self, client: OpenAI, model: str):
+    def __init__(self, client: OpenAI, model: str, model_mini: str | None = None):
         self.client = client
         self.model = model
+        self.model_mini = model_mini or model
 
     def _optimize_query(self, query: str) -> str:
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content":
-                f"Convert to a short English search engine query (3-6 keywords, no punctuation).\n"
-                f"Reply with ONLY the query in English, nothing else.\n"
-                f"Input: {query}"
-            }]
-        )
+        response = call_llm(self.client, self.model_mini, [{"role": "user", "content":
+            f"Convert to a short English search engine query (3-6 keywords, no punctuation).\n"
+            f"Reply with ONLY the query in English, nothing else.\n"
+            f"Input: {query}"
+        }])
         return response.choices[0].message.content.strip() or query
 
     def _format_results(self, results: list[dict]) -> str:
@@ -57,10 +57,7 @@ class WebSearchTool:
             f"Example output: 1, 3, 5\n\n"
             f"Sources ({len(results)} total):\n{formatted}"
         )
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}],
-        )
+        response = call_llm(self.client, self.model_mini, [{"role": "user", "content": prompt}])
         raw = response.choices[0].message.content or ""
 
         # Валидация — извлекаем только цифры
@@ -116,9 +113,10 @@ if __name__ == "__main__":
     import os
     from dotenv import load_dotenv
     from openai import OpenAI
+    from core.config import MODEL, MODEL_MINI
 
     load_dotenv()
     client = OpenAI(base_url='https://api.groq.com/openai/v1', api_key=os.environ['API_TOKEN'])
-    tool = WebSearchTool(client, 'meta-llama/llama-4-scout-17b-16e-instruct')
+    tool = WebSearchTool(client, MODEL, model_mini=MODEL_MINI)
     result = tool.execute('Что такое абоба?')
     print(result)

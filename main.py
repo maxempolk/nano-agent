@@ -9,6 +9,7 @@ from core.logger import SessionLogger
 from core.tools.web_search import WebSearchTool
 from core.tools import cron as cron_tool
 from core.cron_runner import CronRunner
+from core.config import MODEL, MODEL_MINI
 
 load_dotenv()
 
@@ -86,7 +87,6 @@ Use web_search whenever the answer could have changed since your training: price
 Be concise. No explanations unless asked. No confirmations like "Sure!" or "I'll do that now.".
 Report errors and results only. Skip filler.""" + TELEGRAM_SKILL
 
-MODEL = "meta-llama/llama-4-scout-17b-16e-instruct"
 CONTEXT_WINDOW = 10
 MAX_TOOL_OUTPUT = 2000
 
@@ -98,7 +98,7 @@ client = OpenAI(
 logger = SessionLogger()
 logger.info(f"mode={mode} | model={MODEL}")
 
-web_search = WebSearchTool(client, MODEL)
+web_search = WebSearchTool(client, MODEL, model_mini=MODEL_MINI)
 
 class CronToolWrapper:
     SCHEMA = cron_tool.SCHEMA
