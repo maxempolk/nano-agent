@@ -25,12 +25,14 @@ if mode == "telegram" and not os.environ.get("TELEGRAM_BOT_TOKEN"):
     sys.exit(1)
 
 def _system_info() -> str:
+    from datetime import datetime
     return (
         f"OS: {platform.system()} {platform.release()} | "
         f"Python: {platform.python_version()} | "
         f"CWD: {os.getcwd()} | "
         f"User: {os.environ.get('USER', 'unknown')} | "
-        f"Shell: {os.environ.get('SHELL', 'unknown')}"
+        f"Shell: {os.environ.get('SHELL', 'unknown')} | "
+        f"DateTime: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} (local)"
     )
 
 TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
@@ -78,7 +80,7 @@ Always respond in the same language the user writes in.
 - When unsure if a command is safe: ask, don't run.
 
 ## Tools
-Use web_search ONLY when the query explicitly requires current or real-time information (news, prices, live data). Do not search for things you already know.
+Use web_search whenever the answer could have changed since your training: prices, rates, news, events, software versions, availability, weather, or any fact tied to a specific point in time. If there's any doubt whether your knowledge is current — search.
 
 ## Output
 Be concise. No explanations unless asked. No confirmations like "Sure!" or "I'll do that now.".
@@ -100,16 +102,28 @@ web_search = WebSearchTool(client, MODEL)
 
 class CronToolWrapper:
     SCHEMA = cron_tool.SCHEMA
-    def execute(self, **kwargs): return cron_tool.execute(**kwargs)
+    def __init__(self):
+        self._runner = None
+
+    def execute(self, **kwargs):
+        result = cron_tool.execute(**kwargs)
+        if kwargs.get("action") == "add" and self._runner:
+            self._runner._reload_jobs()
+        return result
 
 cron_wrapper = CronToolWrapper()
 
-CRON_SKILL = "\nUse cron_manage to add, list or remove scheduled tasks. Schedule format: cron expression \"minute hour day month weekday\"."
+CRON_SKILL = "\nUse cron_manage to schedule tasks: recurring (schedule='0 9 * * *'), one-time absolute (run_at='2026-06-27 15:30'), or one-time relative (run_in=60 for 'in 60 seconds'). Use run_in for all relative times — never compute datetimes yourself. The prompt must describe WHAT to do only — no curl or Telegram commands. When user says 'через X' — always schedule with cron_manage, never execute immediately."
+
+# Промпт для крон-агентов: без Telegram-скилла, запрет слать сообщения напрямую
+CRON_SYSTEM = SYSTEM + "\nDo NOT send messages to Telegram directly. Just return the result as plain text — the scheduler will deliver it."
 
 # Фабрика для крон-задач — без cron_manage, чтобы задачи не могли создавать задачи рекурсивно
 def cron_agent_factory():
-    return Agent(client, MODEL, SYSTEM, CONTEXT_WINDOW, MAX_TOOL_OUTPUT,
-                 extra_tools=[web_search])
+    cron_logger = SessionLogger()
+    cron_logger.info("mode=cron")
+    return Agent(client, MODEL, CRON_SYSTEM, CONTEXT_WINDOW, MAX_TOOL_OUTPUT,
+                 logger=cron_logger, extra_tools=[web_search])
 
 agent = Agent(client, MODEL, SYSTEM + CRON_SKILL, CONTEXT_WINDOW, MAX_TOOL_OUTPUT,
               logger=logger, extra_tools=[web_search, cron_wrapper])
@@ -117,6 +131,7 @@ agent = Agent(client, MODEL, SYSTEM + CRON_SKILL, CONTEXT_WINDOW, MAX_TOOL_OUTPU
 if TELEGRAM_BOT_TOKEN and ALLOWED_USER_ID:
     cron_runner = CronRunner(cron_agent_factory, TELEGRAM_BOT_TOKEN, ALLOWED_USER_ID)
     cron_runner.start()
+    cron_wrapper._runner = cron_runner
 
 if mode == "telegram":
     from interfaces.telegram import run

@@ -90,7 +90,10 @@ class Agent:
                     if not handler:
                         result = f"Неизвестный инструмент: {call.function.name}"
                     else:
-                        result = _truncate(handler(**args), self.max_tool_output)
+                        try:
+                            result = _truncate(handler(**args), self.max_tool_output)
+                        except TypeError as e:
+                            result = f"Ошибка вызова инструмента {call.function.name}: {e}"
 
                     if call.function.name == "web_search":
                         tool_obj = self.tool_objects.get("web_search")
