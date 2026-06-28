@@ -22,6 +22,11 @@ def _send_telegram(token: str, chat_id: str, text: str) -> None:
 
 def _run_job(job: dict, agent_factory, token: str, chat_id: str) -> None:
     print(f"[cron] Запуск задачи '{job['name']}'")
+    # Удаляем одноразовую задачу ДО выполнения — иначе _reload_jobs успеет
+    # прочитать jobs.json пока задача ещё выполняется и добавит её заново
+    if job.get("type") == "once":
+        remove_job(job["name"])
+        print(f"[cron] Одноразовая задача '{job['name']}' удалена из jobs.json")
     try:
         agent = agent_factory()
         reply = agent.run_turn(job["prompt"])
@@ -29,11 +34,6 @@ def _run_job(job: dict, agent_factory, token: str, chat_id: str) -> None:
     except Exception as e:
         print(f"[cron] Ошибка в задаче '{job['name']}': {e}")
         _send_telegram(token, chat_id, f"⏰ <b>{job['name']}</b>\n\nОшибка: {e}")
-
-    # Удаляем одноразовую задачу после выполнения
-    if job.get("type") == "once":
-        remove_job(job["name"])
-        print(f"[cron] Одноразовая задача '{job['name']}' удалена после выполнения")
 
 
 class CronRunner:

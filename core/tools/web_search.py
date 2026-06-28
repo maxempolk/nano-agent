@@ -80,34 +80,50 @@ class WebSearchTool:
             downloaded = trafilatura.fetch_url(url)
             text = trafilatura.extract(downloaded) or ""
             if len(text) > MAX_CONTENT_CHARS:
-                text = text[:MAX_CONTENT_CHARS] + f"\n... [обрезано]"
+                text = text[:MAX_CONTENT_CHARS] + "\n... [обрезано]"
             return text or "Не удалось извлечь текст."
         except Exception as e:
             return f"Ошибка парсинга: {e}"
 
+    def _extract_facts(self, original_query: str, pages: list[dict]) -> str:
+        sources = ""
+        for i, p in enumerate(pages):
+            sources += f"[{i+1}] {p['url']}\n{p['content']}\n\n"
+        prompt = (
+            f"Question: {original_query}\n\n"
+            f"Extract key facts relevant to the question from each source below.\n"
+            f"For each source output: [N] followed by 2-3 bullet points.\n"
+            f"Be specific — numbers, dates, names. Skip irrelevant content.\n\n"
+            f"{sources.strip()}"
+        )
+        response = call_llm(self.client, self.model_mini, [{"role": "user", "content": prompt}])
+        return response.choices[0].message.content or ""
+
     def execute(self, query: str) -> str:
+        original_query = query
+
         # 1. Оптимизируем запрос
         self.last_query = self._optimize_query(query)
-        query = self.last_query
 
         # 2. Поиск
         with DDGS() as ddg:
-            results = ddg.text(query, max_results=MAX_RESULTS)
+            results = ddg.text(self.last_query, max_results=MAX_RESULTS)
         if not results:
             return "Ничего не найдено."
 
-        # 3. Форматируем и выбираем релевантные
+        # 3. Выбираем релевантные источники
         formatted = self._format_results(results)
         indices = self._pick_relevant(formatted, results)
 
         # 4. Парсим выбранные сайты
-        parts = []
+        pages = []
         for i in indices:
             url = results[i]["href"]
             content = self._scrape(url)
-            parts.append(f"[Source: {url}]\n{content}")
+            pages.append({"url": url, "content": content})
 
-        return "\n\n---\n\n".join(parts)
+        # 5. Извлекаем ключевые факты батчем
+        return self._extract_facts(original_query, pages)
 
 if __name__ == "__main__":
     import os
