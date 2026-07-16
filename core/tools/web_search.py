@@ -1,12 +1,20 @@
 import trafilatura
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from ddgs import DDGS
 from openai import OpenAI
+
+try:
+    from newspaper import Article as NewspaperArticle
+    _NEWSPAPER_OK = True
+except ImportError:
+    _NEWSPAPER_OK = False
 
 from core.llm import call_llm
 
 MAX_RESULTS = 10
 MAX_SCRAPE = 3
-MAX_CONTENT_CHARS = 2000
+MAX_CONTENT_CHARS = 4000
+MAX_PARAGRAPHS = 30
 
 SCHEMA = {
     "type": "function",
@@ -75,15 +83,50 @@ class WebSearchTool:
 
         return indices[:MAX_SCRAPE]
 
-    def _scrape(self, url: str) -> str:
+    def _scrape_trafilatura(self, url: str) -> str:
         try:
             downloaded = trafilatura.fetch_url(url)
-            text = trafilatura.extract(downloaded) or ""
-            if len(text) > MAX_CONTENT_CHARS:
-                text = text[:MAX_CONTENT_CHARS] + "\n... [обрезано]"
-            return text or "Не удалось извлечь текст."
-        except Exception as e:
-            return f"Ошибка парсинга: {e}"
+            return trafilatura.extract(downloaded) or ""
+        except Exception:
+            return ""
+
+    def _scrape_newspaper(self, url: str) -> str:
+        if not _NEWSPAPER_OK:
+            return ""
+        try:
+            article = NewspaperArticle(url)
+            article.download()
+            article.parse()
+            return article.text or ""
+        except Exception:
+            return ""
+
+    def _smart_truncate(self, text: str, query: str) -> str:
+        if len(text) <= MAX_CONTENT_CHARS:
+            return text
+        paragraphs = [p.strip() for p in text.split("\n") if len(p.strip()) > 40][:MAX_PARAGRAPHS]
+        if not paragraphs:
+            return text[:MAX_CONTENT_CHARS]
+        query_words = set(query.lower().split())
+        def score(p: str) -> int:
+            return len(set(p.lower().split()) & query_words)
+        ranked = sorted(range(len(paragraphs)), key=lambda i: score(paragraphs[i]), reverse=True)
+        selected: set[int] = set()
+        total = 0
+        for i in ranked:
+            if total + len(paragraphs[i]) > MAX_CONTENT_CHARS:
+                break
+            selected.add(i)
+            total += len(paragraphs[i])
+        return "\n\n".join(paragraphs[i] for i in sorted(selected))
+
+    def _scrape(self, url: str, query: str = "") -> str:
+        text = self._scrape_trafilatura(url)
+        if len(text) < 200:
+            text = self._scrape_newspaper(url) or text
+        if not text:
+            return "Не удалось извлечь текст."
+        return self._smart_truncate(text, query)
 
     def _extract_facts(self, original_query: str, pages: list[dict]) -> str:
         sources = ""
@@ -115,12 +158,14 @@ class WebSearchTool:
         formatted = self._format_results(results)
         indices = self._pick_relevant(formatted, results)
 
-        # 4. Парсим выбранные сайты
-        pages = []
-        for i in indices:
-            url = results[i]["href"]
-            content = self._scrape(url)
-            pages.append({"url": url, "content": content})
+        # 4. Парсим выбранные сайты параллельно
+        urls = [results[i]["href"] for i in indices]
+        scraped: dict[str, str] = {}
+        with ThreadPoolExecutor(max_workers=len(urls)) as ex:
+            futures = {ex.submit(self._scrape, url, original_query): url for url in urls}
+            for future in as_completed(futures):
+                scraped[futures[future]] = future.result()
+        pages = [{"url": url, "content": scraped[url]} for url in urls]
 
         # 5. Извлекаем ключевые факты батчем
         return self._extract_facts(original_query, pages)
