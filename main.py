@@ -17,7 +17,7 @@ from core.config import (
 )
 from core.cron_runner import CronRunner
 from core.logger import SessionLogger
-from core.model_router import AppleModelRouter, ModelRoute
+from core.model_router import AppleModelRouter, ModelRoute, resolve_model_mode
 from core.prompts import PROFILES, build_prompt_set
 from core.tools import cron as cron_tool
 from core.tools.web_search import WebSearchTool
@@ -30,12 +30,16 @@ interface.add_argument("--cli", action="store_true", help="терминальн�
 interface.add_argument("--telegram", action="store_true", help="Telegram-интерфейс")
 model_group = parser.add_mutually_exclusive_group()
 model_group.add_argument(
-    "--model", choices=("auto", "local", "pcc"),
-    help="маршрутизация Apple-моделей (по умолчанию: auto)",
+    "--model", choices=("hybrid", "auto", "local", "pcc", "server"),
+    help="маршрутизация Apple-моделей (по умолчанию: hybrid)",
 )
 model_group.add_argument(
     "--local", action="store_true",
-    help="устаревший alias для --model local",
+    help="только локальная AFM Core 3, без PCC",
+)
+model_group.add_argument(
+    "--server", action="store_true",
+    help="только Apple PCC, без локальной модели",
 )
 parser.add_argument(
     "--prompts",
@@ -45,9 +49,15 @@ parser.add_argument(
 args = parser.parse_args()
 
 mode = "telegram" if args.telegram else "cli"
-model_mode = "local" if args.local else (args.model or os.environ.get("MODEL_MODE", "auto"))
-if model_mode not in {"auto", "local", "pcc"}:
-    print("Ошибка: MODEL_MODE должен быть auto, local или pcc")
+try:
+    model_mode = resolve_model_mode(
+        cli_model=args.model,
+        local=args.local,
+        server=args.server,
+        env_mode=os.environ.get("MODEL_MODE"),
+    )
+except ValueError:
+    print("Ошибка: MODEL_MODE должен быть hybrid, local или pcc")
     sys.exit(1)
 
 prompt_override = args.prompts or os.environ.get("PROMPT_PROFILE")
@@ -132,11 +142,15 @@ logger.info(
     f"web_search={WEB_SEARCH_FORCE_DEPTH}"
 )
 
-# Вспомогательная обработка поиска всегда локальная; PCC получает только основную задачу.
+# Hybrid: PCC планирует/синтезирует исследование, AFM извлекает страницы.
+# Строгие local/server режимы не пересекают выбранную границу.
+search_worker_model = APPLE_PCC_MODEL if model_mode == "pcc" else APPLE_LOCAL_MODEL
+search_planner_model = APPLE_LOCAL_MODEL if model_mode == "local" else APPLE_PCC_MODEL
 web_search = WebSearchTool(
     client,
-    APPLE_LOCAL_MODEL,
-    model_mini=APPLE_LOCAL_MODEL,
+    search_worker_model,
+    model_mini=search_worker_model,
+    planner_model=search_planner_model,
     logger=logger,
     force_depth=None if WEB_SEARCH_FORCE_DEPTH == "auto" else WEB_SEARCH_FORCE_DEPTH,
 )
@@ -163,11 +177,11 @@ def _router(*, cron: bool = False) -> AppleModelRouter:
     pcc_system = pcc_prompts.cron_agent if cron else pcc_prompts.agent
     local = ModelRoute(
         "local", APPLE_LOCAL_MODEL, local_system, LOCAL_TOKEN_BUDGET,
-        fallback_model=APPLE_PCC_MODEL,
+        fallback_model=APPLE_PCC_MODEL if model_mode == "hybrid" else None,
     )
     pcc = ModelRoute(
         "pcc", APPLE_PCC_MODEL, pcc_system, PCC_TOKEN_BUDGET,
-        fallback_model=APPLE_LOCAL_MODEL,
+        fallback_model=APPLE_LOCAL_MODEL if model_mode == "hybrid" else None,
     )
     return AppleModelRouter(local, pcc, mode=model_mode)
 
@@ -188,7 +202,7 @@ def _make_agent(agent_logger, *, cron: bool = False, extra_tools=None) -> Agent:
         compact_prompt=local_prompts.compact,
         compact_trigger_ratio=COMPACT_RATIO,
         route_selector=router.select,
-        compact_model=APPLE_LOCAL_MODEL,
+        compact_model=APPLE_PCC_MODEL if model_mode == "pcc" else APPLE_LOCAL_MODEL,
     )
 
 

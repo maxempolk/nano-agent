@@ -74,6 +74,75 @@ class AgentForcedSearchTests(TestCase):
         self.assertTrue(any(message.get("role") == "tool" for message in agent.messages))
         self.assertEqual(llm.call_args.args[3], [])
 
+    def test_hallucinated_search_after_forced_search_is_blocked_and_recovered(self):
+        web = FakeWebSearch()
+        agent = Agent(None, "system", "SYSTEM", extra_tools=[web])
+        ghost_call = _tool_completion(
+            "web_search",
+            '{"query":"repeat the whole research","depth":"deep"}',
+        )
+
+        with patch(
+            "core.agent.call_llm",
+            side_effect=[ghost_call, _completion("Один итоговый ответ")],
+        ) as llm:
+            reply = agent.run_turn("подробно исследуй уровень жизни в Норвегии")
+
+        self.assertEqual(reply, "Один итоговый ответ")
+        web.execute.assert_called_once()
+        self.assertEqual(len(llm.call_args_list), 2)
+        self.assertEqual(llm.call_args_list[1].args[3], [])
+        recovery_messages = llm.call_args_list[1].args[2]
+        self.assertFalse(any(message.get("role") == "tool" for message in recovery_messages))
+        self.assertEqual([message["role"] for message in recovery_messages], ["system", "user"])
+        self.assertIn("GPT-5.4", recovery_messages[1]["content"])
+
+    def test_empty_protocol_recovery_returns_tool_evidence_instead_of_silence(self):
+        web = FakeWebSearch()
+        agent = Agent(None, "system", "SYSTEM", extra_tools=[web])
+
+        with patch(
+            "core.agent.call_llm",
+            side_effect=[
+                _tool_completion("web_search", '{"query":"repeat","depth":"deep"}'),
+                _completion(""),
+            ],
+        ):
+            reply = agent.run_turn("подробно исследуй Норвегию")
+
+        self.assertTrue(reply.strip())
+        self.assertIn("GPT-5.4", reply)
+        web.execute.assert_called_once()
+
+    def test_repeated_tool_call_during_recovery_returns_tool_evidence(self):
+        web = FakeWebSearch()
+        agent = Agent(None, "system", "SYSTEM", extra_tools=[web])
+        ghost = _tool_completion("web_search", '{"query":"repeat","depth":"deep"}')
+
+        with patch("core.agent.call_llm", side_effect=[ghost, ghost]):
+            reply = agent.run_turn("подробно исследуй Норвегию")
+
+        self.assertIn("GPT-5.4", reply)
+        web.execute.assert_called_once()
+
+    def test_unoffered_tool_is_never_executed(self):
+        web = FakeWebSearch()
+        agent = Agent(None, "system", "SYSTEM", extra_tools=[web])
+        shell = Mock()
+        agent.handlers["not_offered"] = shell
+
+        with patch(
+            "core.agent.call_llm",
+            side_effect=[
+                _tool_completion("not_offered", '{"command":"unsafe"}'),
+                _completion("recovered"),
+            ],
+        ):
+            reply = agent.run_turn("hello")
+
+        self.assertEqual(reply, "recovered")
+        shell.assert_not_called()
+
     def test_model_cannot_escalate_simple_question_to_deep_or_search_twice(self):
         web = FakeWebSearch()
         agent = Agent(None, "system", "SYSTEM", extra_tools=[web])

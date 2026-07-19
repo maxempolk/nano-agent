@@ -47,6 +47,8 @@ def _format_tool_trace(tool_calls: list[tuple[str, str, str]], secret: str = "")
 
 def _messages_with_tool_trace(reply: str, tool_calls: list[tuple[str, str, str]],
                               secret: str = "") -> list[str]:
+    if not reply.strip():
+        reply = "Модель не сформировала текстовый ответ. Результаты инструментов приведены ниже."
     trace = _format_tool_trace(tool_calls, secret=secret)
     if trace and len(reply) + len(trace) > MAX_COMBINED_MESSAGE_CHARS:
         return [reply, trace.strip()]
@@ -156,6 +158,9 @@ def _send_messages(base: str, chat_id: int, messages: list[str],
 
 def _deliver_final(base: str, chat_id: int, status_message_id: int | None,
                    messages: list[str], logger: SessionLogger | None = None) -> None:
+    messages = [message for message in messages if message.strip()]
+    if not messages:
+        messages = ["Не удалось сформировать ответ. Попробуйте повторить запрос."]
     if status_message_id is not None and messages:
         if _edit_message(base, chat_id, status_message_id, messages[0], logger):
             _send_messages(base, chat_id, messages[1:], logger)

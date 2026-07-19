@@ -5,6 +5,7 @@ from interfaces.telegram import (
     _command_name,
     _context_command_reply,
     _deliver_final,
+    _messages_with_tool_trace,
     _progress_message,
 )
 
@@ -68,3 +69,15 @@ class TelegramContextCommandTests(TestCase):
 
         edit.assert_called_once_with("base", 123, 456, "answer", None)
         send.assert_called_once_with("base", 123, ["trace"], None)
+
+    def test_empty_agent_reply_is_never_delivered_silently(self):
+        messages = _messages_with_tool_trace("", [])
+
+        self.assertEqual(len(messages), 1)
+        self.assertTrue(messages[0].strip())
+
+    def test_empty_final_replaces_progress_with_explicit_error(self):
+        with patch("interfaces.telegram._edit_message", return_value=True) as edit:
+            _deliver_final("base", 123, 456, [])
+
+        self.assertIn("Не удалось сформировать ответ", edit.call_args.args[3])

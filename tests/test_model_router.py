@@ -1,6 +1,6 @@
 from unittest import TestCase
 
-from core.model_router import AppleModelRouter, ModelRoute
+from core.model_router import AppleModelRouter, ModelRoute, resolve_model_mode
 
 
 class AppleModelRouterTests(TestCase):
@@ -13,6 +13,16 @@ class AppleModelRouterTests(TestCase):
 
         self.assertEqual(decision.route, self.local)
         self.assertEqual(decision.reason, "simple request")
+
+    def test_hybrid_is_default_and_auto_is_compatible_alias(self):
+        self.assertEqual(resolve_model_mode(), "hybrid")
+        self.assertEqual(resolve_model_mode(cli_model="auto"), "hybrid")
+        self.assertEqual(AppleModelRouter(self.local, self.pcc).mode, "hybrid")
+        self.assertEqual(AppleModelRouter(self.local, self.pcc, "auto").mode, "hybrid")
+
+    def test_explicit_flags_override_environment_mode(self):
+        self.assertEqual(resolve_model_mode(local=True, env_mode="pcc"), "local")
+        self.assertEqual(resolve_model_mode(server=True, env_mode="local"), "pcc")
 
     def test_complex_development_request_uses_pcc(self):
         decision = AppleModelRouter(self.local, self.pcc).select(
@@ -53,5 +63,14 @@ class AppleModelRouterTests(TestCase):
         self.assertIsNone(local_route.fallback_model)
         self.assertEqual(
             AppleModelRouter(self.local, self.pcc, "pcc").select("Привет").route,
-            self.pcc,
+            ModelRoute("pcc", "pcc", "FULL", 12000, None),
         )
+
+    def test_server_alias_is_pcc_only_without_local_fallback(self):
+        router = AppleModelRouter(self.local, self.pcc, "server")
+
+        decision = router.select("Привет")
+
+        self.assertEqual(router.mode, "pcc")
+        self.assertEqual(decision.route.model, "pcc")
+        self.assertIsNone(decision.route.fallback_model)

@@ -105,6 +105,49 @@ def _without_tool(tools: list, name: str) -> list:
     ]
 
 
+def _tool_names(tools: list) -> set[str]:
+    return {
+        name
+        for tool in tools
+        if (name := tool.get("function", {}).get("name"))
+    }
+
+
+def _finalization_messages(context_messages: list, user_input: str,
+                           evidence: list[tuple[str, str]]) -> list[dict]:
+    system = _message_dict(context_messages[0]).get("content", "")
+    system += (
+        "\n\nReturn the final answer now. Use the supplied tool evidence, do not call or "
+        "describe tools, and write normal prose rather than JSON. Never return an empty answer."
+    )
+    evidence_text = "\n\n".join(
+        f"[{name}]\n{result}" for name, result in evidence
+    )
+    return [
+        {"role": "system", "content": system},
+        {
+            "role": "user",
+            "content": (
+                f"User request:\n{user_input}\n\n"
+                f"Available tool evidence:\n{evidence_text or 'No tool evidence available.'}"
+            ),
+        },
+    ]
+
+
+def _tool_evidence_fallback(evidence: list[tuple[str, str]]) -> str:
+    if not evidence:
+        return "Не удалось сформировать ответ: модель вернула пустой результат."
+    name, result = evidence[-1]
+    result = result.strip()
+    if not result:
+        return f"Инструмент {name} завершился без результата."
+    return (
+        "Не удалось сформировать итоговый текст модели. Ниже — результат "
+        f"инструмента {name}:\n\n{result}"
+    )
+
+
 class Agent:
     def __init__(self, client: OpenAI, model: str, system: str,
                  compact_keep_messages: int = 10, max_tool_output: int = 2000,
@@ -292,6 +335,9 @@ class Agent:
         self.last_search_query: str | None = None
         tool_calls_made = 0
         turn_tools = self.tools
+        search_completed = False
+        protocol_retry_used = False
+        turn_evidence: list[tuple[str, str]] = []
 
         search_query = _forced_web_search_query(user_input, previous_user_input)
         web_handler = self.handlers.get("web_search")
@@ -316,6 +362,7 @@ class Agent:
                 self.logger.tool_result(result)
             if on_tool_call:
                 on_tool_call("web_search", arguments, result)
+            turn_evidence.append(("web_search", result))
 
             self.messages.extend([
                 {
@@ -330,6 +377,7 @@ class Agent:
                 {"role": "tool", "tool_call_id": call_id, "content": result},
             ])
             tool_calls_made = 1
+            search_completed = True
             # После гарантированного поиска этому ходу больше не нужны tools:
             # компактная AFM иначе пытается повторять web_search или curl через bash.
             turn_tools = []
@@ -385,6 +433,61 @@ class Agent:
                 )
 
             if message.tool_calls:
+                allowed_tools = _tool_names(turn_tools)
+                forbidden_calls = [
+                    call for call in message.tool_calls
+                    if (
+                        call.function.name not in allowed_tools
+                        or (call.function.name == "web_search" and search_completed)
+                    )
+                ]
+                if forbidden_calls:
+                    names = ",".join(call.function.name for call in forbidden_calls)
+                    if self.logger:
+                        self.logger.error(
+                            "tool protocol violation | "
+                            f"returned={names} | allowed={','.join(sorted(allowed_tools)) or '-'} | "
+                            f"search_completed={str(search_completed).lower()}"
+                        )
+                    if not protocol_retry_used:
+                        protocol_retry_used = True
+                        recovery_messages = _finalization_messages(
+                            windowed, user_input, turn_evidence
+                        )
+                        if self.logger:
+                            self.logger.info(
+                                "tool protocol recovery | start | "
+                                f"model={self.model} | evidence={len(turn_evidence)}"
+                            )
+                        try:
+                            response = call_llm(
+                                self.client, self.model, recovery_messages, []
+                            )  # type: ignore
+                            message = response.choices[0].message
+                            finish_reason = response.choices[0].finish_reason
+                            if self.logger:
+                                self.logger.info(
+                                    "tool protocol recovery | end | "
+                                    f"finish_reason={finish_reason} | "
+                                    f"tool_calls={len(message.tool_calls) if message.tool_calls else 0} | "
+                                    f"content_len={len(message.content or '')}"
+                                )
+                        except Exception as error:
+                            if self.logger:
+                                self.logger.error(f"tool protocol recovery failed: {error}")
+                            message = None
+                        if message and not message.tool_calls and (message.content or "").strip():
+                            reply = (message.content or "").strip()
+                            self.messages.append({"role": "assistant", "content": reply})
+                            if self.logger:
+                                self.logger.agent(reply)
+                            return reply
+                    reply = _tool_evidence_fallback(turn_evidence)
+                    self.messages.append({"role": "assistant", "content": reply})
+                    if self.logger:
+                        self.logger.error(reply)
+                    return reply
+
                 if tool_calls_made >= MAX_TOOL_CALLS_PER_TURN:
                     reply = "Достигнут лимит вызовов инструментов за один ход. Остановился."
                     if self.logger:
@@ -474,6 +577,7 @@ class Agent:
                             result = f"Ошибка вызова инструмента {call.function.name}: {e}"
 
                     if call.function.name == "web_search":
+                        search_completed = True
                         tool_obj = self.tool_objects.get("web_search")
                         self.last_search_query = getattr(tool_obj, "last_query", args.get("query"))
                         # После поиска AFM должна сформировать ответ из результата,
@@ -492,6 +596,7 @@ class Agent:
                             json.dumps(args, ensure_ascii=False),
                             result,
                         )
+                    turn_evidence.append((call.function.name, result))
 
                     self.messages.append({
                         "role": "tool",

@@ -4,6 +4,17 @@ from dataclasses import dataclass, replace
 import re
 
 
+def resolve_model_mode(*, cli_model: str | None = None, local: bool = False,
+                       server: bool = False, env_mode: str | None = None) -> str:
+    requested = "local" if local else "server" if server else (
+        cli_model or env_mode or "hybrid"
+    )
+    mode = {"auto": "hybrid", "server": "pcc"}.get(requested, requested)
+    if mode not in {"hybrid", "local", "pcc"}:
+        raise ValueError(f"Неизвестный режим модели: {requested}")
+    return mode
+
+
 @dataclass(frozen=True)
 class ModelRoute:
     name: str
@@ -44,13 +55,10 @@ class AppleModelRouter:
         re.IGNORECASE,
     )
 
-    def __init__(self, local: ModelRoute, pcc: ModelRoute, mode: str = "auto"):
-        if mode not in {"auto", "local", "pcc"}:
-            raise ValueError(f"Неизвестный режим модели: {mode}")
-        # Принудительный local-режим является строгой privacy boundary:
-        # никакой сбой не должен незаметно отправить запрос в PCC.
+    def __init__(self, local: ModelRoute, pcc: ModelRoute, mode: str = "hybrid"):
+        mode = resolve_model_mode(cli_model=mode)
         self.local = replace(local, fallback_model=None) if mode == "local" else local
-        self.pcc = pcc
+        self.pcc = replace(pcc, fallback_model=None) if mode == "pcc" else pcc
         self.mode = mode
         self._last_auto_route = self.local
 
