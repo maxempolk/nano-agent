@@ -5,6 +5,7 @@ from interfaces.telegram import (
     _command_name,
     _context_command_reply,
     _deliver_final,
+    _format_tool_trace,
     _messages_with_tool_trace,
     _progress_message,
 )
@@ -47,20 +48,37 @@ class TelegramContextCommandTests(TestCase):
         agent.clear_context.assert_called_once_with()
         self.assertEqual(reply, "Контекст очищен. Начинаем новый диалог.")
 
-    def test_progress_shows_tool_arguments_result_and_hides_secret(self):
+    def test_progress_accumulates_compact_tool_actions_without_quote_or_results(self):
         message = _progress_message([
             (
                 "web_search",
                 '{"query":"latest GPT","token":"secret-token"}',
                 "Found GPT-5.6 using secret-token",
-            )
+            ),
+            (
+                "execute_bash",
+                '{"command":"git status"}',
+                "clean",
+            ),
         ], secret="secret-token")
 
         self.assertIn("Продолжаю работу", message)
         self.assertIn("web_search", message)
         self.assertIn("latest GPT", message)
-        self.assertIn("Found GPT-5.6", message)
+        self.assertIn("execute_bash", message)
+        self.assertIn("git status", message)
+        self.assertNotIn("Found GPT-5.6", message)
+        self.assertNotIn("<blockquote", message)
         self.assertNotIn("secret-token", message)
+
+    def test_final_tool_trace_is_compact_expandable_quote(self):
+        trace = _format_tool_trace([
+            ("web_search", '{"query":"latest GPT"}', "x" * 1000),
+        ])
+
+        self.assertIn("<blockquote expandable>", trace)
+        self.assertIn("web_search", trace)
+        self.assertLess(len(trace), 1000)
 
     def test_final_replaces_progress_message_then_sends_overflow(self):
         with patch("interfaces.telegram._edit_message", return_value=True) as edit, \

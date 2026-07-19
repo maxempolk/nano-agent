@@ -1,17 +1,18 @@
 from __future__ import annotations
 from html import escape
+import json
 import time
 import httpx
 from urllib.parse import quote_plus
 from core.agent import Agent
 from core.logger import SessionLogger
 
-MAX_TRACE_ITEM_CHARS = 600
-MAX_TRACE_CHARS = 2800
+MAX_TRACE_ARGUMENT_CHARS = 180
+MAX_TRACE_RESULT_CHARS = 280
+MAX_TRACE_CHARS = 1800
 MAX_COMBINED_MESSAGE_CHARS = 3800
-MAX_PROGRESS_ARGUMENT_CHARS = 350
-MAX_PROGRESS_RESULT_CHARS = 500
-MAX_PROGRESS_TOOLS = 6
+MAX_PROGRESS_ACTION_CHARS = 140
+MAX_PROGRESS_TOOLS = 20
 
 
 def _shorten(text: str, limit: int) -> str:
@@ -28,12 +29,12 @@ def _format_tool_trace(tool_calls: list[tuple[str, str, str]], secret: str = "")
     for index, (name, arguments, result) in enumerate(tool_calls):
         arguments = arguments.replace(secret, "[скрыто]") if secret else arguments
         result = result.replace(secret, "[скрыто]") if secret else result
-        arguments = escape(_shorten(arguments, MAX_TRACE_ITEM_CHARS))
-        result = escape(_shorten(result, MAX_TRACE_ITEM_CHARS))
+        arguments = escape(_shorten(arguments, MAX_TRACE_ARGUMENT_CHARS))
+        result = escape(_shorten(result, MAX_TRACE_RESULT_CHARS))
         item = (
-            f"\n<b>{escape(name)}</b>\n"
-            f"Аргументы: <code>{arguments}</code>\n"
-            f"Результат: <code>{result}</code>"
+            f"\n<b>{index + 1}. {escape(name)}</b>\n"
+            f"<code>{arguments}</code>\n"
+            f"<i>Результат:</i> <code>{result}</code>"
         )
         if len("\n".join(parts)) + len(item) > MAX_TRACE_CHARS:
             omitted = len(tool_calls) - index
@@ -43,6 +44,30 @@ def _format_tool_trace(tool_calls: list[tuple[str, str, str]], secret: str = "")
 
     body = "\n".join(parts)
     return f"\n\n<blockquote expandable>{body}</blockquote>"
+
+
+def _tool_action(name: str, arguments: str) -> str:
+    try:
+        values = json.loads(arguments or "{}")
+    except json.JSONDecodeError:
+        values = {}
+    if not isinstance(values, dict):
+        values = {}
+
+    if name == "web_search":
+        query = str(values.get("query") or "поиск в интернете")
+        depth = values.get("depth")
+        suffix = f" · {depth}" if depth else ""
+        return f"ищет «{query}»{suffix}"
+    if name == "execute_bash":
+        return f"выполняет команду {values.get('command') or ''}".strip()
+    if name == "cron":
+        return f"работает с расписанием: {values.get('action') or 'операция'}"
+
+    for key in ("query", "action", "command", "url", "path"):
+        if values.get(key):
+            return f"{key}: {values[key]}"
+    return "выполняет операцию"
 
 
 def _messages_with_tool_trace(reply: str, tool_calls: list[tuple[str, str, str]],
@@ -60,27 +85,25 @@ def _progress_message(tool_calls: list[tuple[str, str, str]], secret: str = "") 
         return "🧠 <b>Думаю…</b>\n<i>Начал обрабатывать запрос.</i>"
 
     visible = tool_calls[-MAX_PROGRESS_TOOLS:]
-    completed = "\n".join(
-        f"✓ <code>{escape(name)}</code>"
-        for name, _, _ in visible
-    )
+    completed_rows = []
+    for index, (name, arguments, _) in enumerate(visible, start=1):
+        if secret:
+            arguments = arguments.replace(secret, "[скрыто]")
+        action = escape(_shorten(
+            _tool_action(name, arguments), MAX_PROGRESS_ACTION_CHARS
+        )).replace("\n", " ")
+        completed_rows.append(
+            f"{index}. ✓ <code>{escape(name)}</code> — <i>{action}</i>"
+        )
+    completed = "\n".join(completed_rows)
     omitted = len(tool_calls) - len(visible)
     if omitted:
         completed = f"… ещё {omitted}\n" + completed
 
-    name, arguments, result = tool_calls[-1]
-    if secret:
-        arguments = arguments.replace(secret, "[скрыто]")
-        result = result.replace(secret, "[скрыто]")
-    arguments = escape(_shorten(arguments, MAX_PROGRESS_ARGUMENT_CHARS))
-    result = escape(_shorten(result.strip() or "Нет вывода", MAX_PROGRESS_RESULT_CHARS))
     return (
         "🧠 <b>Продолжаю работу…</b>\n"
         f"{completed}\n\n"
-        f"<b>Последний инструмент:</b> <code>{escape(name)}</code>\n"
-        f"<blockquote><b>Аргументы</b>\n<code>{arguments}</code>\n\n"
-        f"<b>Ответ инструмента</b>\n{result}</blockquote>\n"
-        "<i>Результат получен, формирую ответ.</i>"
+        "<i>Инструменты завершены, формирую ответ.</i>"
     )
 
 
