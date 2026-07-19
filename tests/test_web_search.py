@@ -177,7 +177,7 @@ class WebSearchStructuredTests(TestCase):
             {
                 "title": "GPT models",
                 "href": "https://example.com/gpt",
-                "body": "Latest model information",
+                "body": "Latest GPT-5.6 model information",
             }
         ]
         self.tool.logger = MagicMock()
@@ -195,6 +195,73 @@ class WebSearchStructuredTests(TestCase):
         logged = "\n".join(call.args[0] for call in self.tool.logger.info.call_args_list)
         self.assertIn("mode=quick", logged)
         self.assertIn("llm_calls=0/0", logged)
+
+    def test_low_quality_numeric_quick_escalates_internally_to_normal(self):
+        results = [{
+            "title": "Administrative divisions - Statistics Norway",
+            "href": "https://www.ssb.no/en/regions",
+            "body": "Updated in 2026. Information about Norway municipalities.",
+        }]
+        evidence = NormalPageEvidence(
+            facts=[NormalFact(claim="Norway has 357 municipalities", evidence="357")],
+            insufficient_information=False,
+        )
+
+        with patch.object(self.tool, "_search", return_value=results), \
+             patch.object(self.tool, "_scrape", return_value="Norway has 357 municipalities"), \
+             patch.object(self.tool, "_extract_normal_page", return_value=evidence) as extract:
+            result = self.tool.execute("сколько коммун в Норвегии?", depth="auto")
+
+        extract.assert_called_once()
+        self.assertIn("357", result)
+        self.assertEqual(self.tool.last_stats["initial_mode"], "quick")
+        self.assertEqual(self.tool.last_stats["mode"], "normal")
+        self.assertTrue(self.tool.last_stats["escalated"])
+        self.assertIn(
+            "expected_value_missing",
+            self.tool.last_stats["quick_quality_reasons"],
+        )
+
+    def test_date_number_is_not_mistaken_for_requested_count(self):
+        intent = self.tool._analyze_intent("сколько коммун в Норвегии?")
+        text = (
+            "Jan 20, 2026. Statistics about administrative divisions. "
+            "A municipality is an administrative level in Norway."
+        )
+
+        self.assertFalse(self.tool._contains_expected_value(intent, text))
+
+    def test_number_near_subject_satisfies_requested_count(self):
+        intent = self.tool._analyze_intent("сколько коммун в Норвегии?")
+
+        self.assertTrue(self.tool._contains_expected_value(
+            intent,
+            "Norway currently has 357 municipalities.",
+        ))
+
+    def test_related_category_count_is_not_mistaken_for_subject_count(self):
+        intent = self.tool._analyze_intent("сколько коммун в Норвегии?")
+
+        self.assertFalse(self.tool._contains_expected_value(
+            intent,
+            "Statistics Norway classified municipalities into 17 categories.",
+        ))
+
+    def test_explicit_quick_never_escalates(self):
+        results = [{
+            "title": "Administrative divisions - Statistics Norway",
+            "href": "https://www.ssb.no/en/regions",
+            "body": "Updated in 2026. Information about Norway municipalities.",
+        }]
+
+        with patch.object(self.tool, "_search", return_value=results), \
+             patch.object(self.tool, "_scrape") as scrape:
+            result = self.tool.execute("сколько коммун в Норвегии?", depth="quick")
+
+        scrape.assert_not_called()
+        self.assertIn("snippets only", result)
+        self.assertEqual(self.tool.last_stats["mode"], "quick")
+        self.assertFalse(self.tool.last_stats["escalated"])
 
     def test_quick_path_prioritizes_known_official_domain(self):
         results = [
@@ -219,6 +286,57 @@ class WebSearchStructuredTests(TestCase):
         ranked = self.tool._rank_quick_results("latest GPT version", results)
 
         self.assertEqual(ranked[0]["href"], "https://help.openai.com/models")
+
+    def test_normal_ranking_prefers_official_administrative_divisions_page(self):
+        results = [
+            {
+                "title": "Municipal accounts - SSB",
+                "href": "https://www.ssb.no/en/statistikk/kommuneregnskap",
+                "body": "Municipalities are classified into 17 categories.",
+            },
+            {
+                "title": "Administrative divisions - SSB",
+                "href": "https://www.ssb.no/en/statistikk/regionale-inndelingar",
+                "body": "Current administrative divisions and municipalities in Norway, 2026.",
+            },
+            {
+                "title": "Municipal health care service - SSB",
+                "href": "https://www.ssb.no/en/statistikk/health-service",
+                "body": "Health services provided by municipalities.",
+            },
+        ]
+        intent = self.tool._analyze_intent("сколько коммун в Норвегии?")
+
+        ranked = self.tool._rank_results(intent, results)
+
+        self.assertIn("regionale-inndelingar", ranked[0]["href"])
+
+    def test_normal_fact_filter_rejects_related_count_and_stale_fact(self):
+        intent = self.tool._analyze_intent("сколько коммун в Норвегии?")
+
+        self.assertFalse(self.tool._fact_matches_intent(intent, NormalFact(
+            claim="Municipalities are classified into 17 categories",
+            evidence="Statistics Norway classified municipalities into 17 categories.",
+            published_at="2026-01-01",
+        )))
+        self.assertFalse(self.tool._fact_matches_intent(intent, NormalFact(
+            claim="Norway has 356 municipalities",
+            evidence="Norway has 356 municipalities.",
+            published_at="2020-01-01",
+        )))
+        self.assertTrue(self.tool._fact_matches_intent(intent, NormalFact(
+            claim="Norway has 357 municipalities",
+            evidence="Norway currently has 357 municipalities.",
+            published_at="2026-01-01",
+        )))
+
+    def test_source_year_uses_most_recent_year_in_result_metadata(self):
+        result = {
+            "title": "Administrative divisions 2024",
+            "body": "Updated January 2026",
+        }
+
+        self.assertEqual(self.tool._source_year(result), 2026)
 
     def test_quick_query_normalizes_live_btc_currency_without_llm(self):
         self.assertEqual(
