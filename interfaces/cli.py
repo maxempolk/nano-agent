@@ -19,4 +19,5 @@ def run(agent: Agent) -> None:
             print(f"  [результат] {result.strip()}\n")
 
         reply = agent.run_turn(user_input, on_tool_call=on_tool_call)
+        print(f"[{agent.last_route_name} · {agent.model}]")
         print(f"Агент: {reply}\n")
