@@ -4,20 +4,17 @@ from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
 from core.tools.web_search import (
-    ExtractedFact,
+    DeepFact,
+    DeepSynthesis,
     ExpectedValue,
     MAX_FORMATTED_RESULT_CHARS,
     LLM_INPUT_TOKEN_BUDGET,
     NormalFact,
     NormalPageEvidence,
-    PAGE_CHUNK_CHARS,
     PAGE_CONTEXT_CHARS,
-    PageEvidence,
     SearchBudget,
     SearchBudgetExceeded,
     SearchMode,
-    SearchSynthesis,
-    SynthesisFact,
     WebSearchTool,
     _estimate_input_tokens,
     _flat_json_schema,
@@ -49,12 +46,12 @@ class WebSearchStructuredTests(TestCase):
         self.assertIn("claim", encoded)
 
     def test_retries_invalid_structured_output(self):
-        valid = '{"source_url":"","facts":[],"missing_information":[]}'
+        valid = '{"facts":[],"insufficient_information":true}'
         with patch(
             "core.tools.web_search.call_llm",
             side_effect=[_completion("not json"), _completion(valid)],
         ) as mocked:
-            result = self.tool._structured("extract", PageEvidence)
+            result = self.tool._structured("extract", NormalPageEvidence)
 
         self.assertEqual(result.facts, [])
         self.assertEqual(mocked.call_count, 2)
@@ -67,17 +64,20 @@ class WebSearchStructuredTests(TestCase):
             return_value=_completion(""),
         ) as mocked:
             with self.assertRaises(ValueError):
-                self.tool._structured("extract", PageEvidence)
+                self.tool._structured("extract", NormalPageEvidence)
 
         mocked.assert_called_once()
 
     def test_structured_prompt_is_trimmed_to_safe_local_input_budget(self):
-        valid = '{"source_url":"","facts":[],"missing_information":[]}'
+        valid = '{"facts":[],"insufficient_information":true}'
         with patch(
             "core.tools.web_search.call_llm",
             return_value=_completion(valid),
         ) as mocked:
-            self.tool._structured("start\n" + "x" * 30_000 + "\nend", PageEvidence)
+            self.tool._structured(
+                "start\n" + "x" * 30_000 + "\nend",
+                NormalPageEvidence,
+            )
 
         messages = mocked.call_args.args[2]
         self.assertLessEqual(
@@ -88,41 +88,18 @@ class WebSearchStructuredTests(TestCase):
         self.assertIn("start", content)
         self.assertIn("end", content)
 
-    def test_split_page_preserves_short_page_and_bounds_chunks(self):
-        text = "\n\n".join(["a" * 5000, "b" * 5000, "c" * 5000, "d" * 5000])
-
-        chunks = self.tool._split_page(text)
-
-        self.assertGreater(len(chunks), 1)
-        self.assertTrue(all(len(chunk) <= PAGE_CHUNK_CHARS for chunk in chunks))
-        self.assertEqual("".join(chunks).replace("\n", ""), text.replace("\n", ""))
-
-    def test_long_page_is_extracted_per_chunk_then_merged(self):
-        content = "x" * (PAGE_CHUNK_CHARS + 100)
-        extracted = PageEvidence(
-            facts=[ExtractedFact(claim="fact", relevance=90)],
-        )
-        merged = PageEvidence(
-            facts=[ExtractedFact(claim="merged", relevance=95)],
-        )
-
-        with patch.object(self.tool, "_extract_chunk", return_value=extracted) as extract, \
-             patch.object(self.tool, "_structured", return_value=merged) as structured:
-            result = self.tool._extract_page("question", "https://example.com", content)
-
-        self.assertEqual(extract.call_count, 2)
-        self.assertEqual(structured.call_count, 1)
-        self.assertEqual(result.source_url, "https://example.com")
-        self.assertEqual(result.facts[0].claim, "merged")
-
     def test_formatted_result_stays_inside_agent_tool_limit(self):
-        pages = [PageEvidence(source_url="https://example.com/" + "u" * 400)]
-        synthesis = SearchSynthesis(facts=[
-            SynthesisFact(claim="fact " + "x" * 500, source_ids=[1])
+        results = [{
+            "title": "Source " + "t" * 300,
+            "href": "https://example.com/" + "u" * 400,
+            "body": "2026",
+        }]
+        synthesis = DeepSynthesis(facts=[
+            DeepFact(claim="fact " + "x" * 500, source_ids=[1])
             for _ in range(8)
         ])
 
-        result = self.tool._format_synthesis(synthesis, pages)
+        result = self.tool._format_deep_results(results, synthesis)
 
         self.assertLessEqual(len(result), MAX_FORMATTED_RESULT_CHARS)
         self.assertIn("[1]", result)
@@ -139,16 +116,10 @@ class WebSearchStructuredTests(TestCase):
 
         with patch.object(self.tool, "_search", return_value=results), \
              patch.object(self.tool, "_scrape", return_value="page text"), \
-             patch.object(self.tool, "_extract_normal_page", return_value=page) as extract, \
-             patch.object(self.tool, "_optimize_query") as optimize, \
-             patch.object(self.tool, "_pick_relevant") as pick, \
-             patch.object(self.tool, "_synthesize") as synthesize:
+             patch.object(self.tool, "_extract_normal_page", return_value=page) as extract:
             result = self.tool.execute("question", depth="normal")
 
         self.assertEqual(extract.call_count, 2)
-        optimize.assert_not_called()
-        pick.assert_not_called()
-        synthesize.assert_not_called()
         self.assertIn("fact", result)
 
     def test_auto_mode_uses_quick_for_simple_question(self):
@@ -366,6 +337,15 @@ class WebSearchStructuredTests(TestCase):
         self.assertTrue(intent.requires_freshness)
         self.assertEqual(intent.search_query(), "current weather Stonglandseidet")
 
+    def test_intent_normalizes_norway_living_standard_research(self):
+        intent = self.tool._analyze_intent("подробно исследуй уровень жизни в Норвегии")
+
+        self.assertTrue(intent.requires_freshness)
+        self.assertEqual(
+            intent.search_query(),
+            "Norway standard of living quality of life latest statistics",
+        )
+
     def test_multiple_known_vendors_do_not_force_one_official_domain(self):
         intent = self.tool._analyze_intent("сравни Apple и Google")
 
@@ -423,24 +403,68 @@ class WebSearchStructuredTests(TestCase):
 
         search.assert_called_once_with("latest GPT model OpenAI site:openai.com")
 
-    def test_deep_does_not_use_llm_query_optimizer(self):
-        results = [{
-            "title": "Research",
-            "href": "https://example.com/research",
-            "body": "body",
-        }]
-        page = PageEvidence(source_url="https://example.com/research")
+    def test_deep_uses_four_page_extractions_and_one_synthesis(self):
+        results = [
+            {
+                "title": f"Research {index}",
+                "href": f"https://example.com/research-{index}",
+                "body": "2026 research evidence",
+            }
+            for index in range(5)
+        ]
+        page = NormalPageEvidence(
+            facts=[NormalFact(claim="fact", evidence="evidence")],
+            insufficient_information=False,
+        )
+        synthesis = DeepSynthesis(
+            facts=[DeepFact(claim="verified", source_ids=[1, 2])],
+        )
 
         with patch.object(self.tool, "_search", return_value=results) as search, \
-             patch.object(self.tool, "_pick_relevant", return_value=[0]), \
              patch.object(self.tool, "_scrape", return_value="page"), \
-             patch.object(self.tool, "_extract_page", return_value=page), \
-             patch.object(self.tool, "_synthesize", return_value=SearchSynthesis()), \
-             patch.object(self.tool, "_optimize_query") as optimize:
+             patch.object(self.tool, "_extract_normal_page", return_value=page) as extract, \
+             patch.object(self.tool, "_synthesize_deep", return_value=synthesis) as synthesize:
+            result = self.tool.execute("подробно исследуй тему", depth="deep")
+
+        search.assert_called_once_with("подробно исследуй тему")
+        self.assertEqual(extract.call_count, 4)
+        synthesize.assert_called_once()
+        self.assertIn("verified", result)
+        self.assertEqual(self.tool.last_stats["max_llm_calls"], 5)
+
+    def test_deep_parallel_extraction_preserves_ranked_source_order(self):
+        results = [
+            {
+                "title": f"Research {index}",
+                "href": f"https://example.com/research-{index}",
+                "body": "2026 research evidence",
+            }
+            for index in range(4)
+        ]
+        captured_pages = []
+
+        def extract(_question, result, _page):
+            index = int(result["title"].rsplit(" ", 1)[1])
+            time.sleep((3 - index) * 0.005)
+            return NormalPageEvidence(
+                facts=[NormalFact(claim=str(index), evidence="evidence")],
+                insufficient_information=False,
+            )
+
+        def synthesize(_question, pages):
+            captured_pages.extend(pages)
+            return DeepSynthesis()
+
+        with patch.object(self.tool, "_search", return_value=results), \
+             patch.object(self.tool, "_scrape", return_value="page"), \
+             patch.object(self.tool, "_extract_normal_page", side_effect=extract), \
+             patch.object(self.tool, "_synthesize_deep", side_effect=synthesize):
             self.tool.execute("подробно исследуй тему", depth="deep")
 
-        optimize.assert_not_called()
-        search.assert_called_once_with("подробно исследуй тему")
+        self.assertEqual(
+            [page.facts[0].claim for page in captured_pages],
+            ["0", "1", "2", "3"],
+        )
 
     def test_normal_path_makes_one_structured_extraction_per_page(self):
         results = [

@@ -7,6 +7,7 @@ from enum import Enum
 import json
 import math
 import re
+from threading import Lock
 import time
 from typing import TYPE_CHECKING, TypeVar
 from urllib.parse import urlparse
@@ -28,16 +29,13 @@ if TYPE_CHECKING:
     from core.logger import SessionLogger
 
 MAX_RESULTS = 10
-MAX_SCRAPE = 3
-PAGE_CHUNK_CHARS = 7_000
-MAX_PAGE_CHUNKS = 8
-MAX_FACTS_PER_CHUNK = 6
-MAX_FACTS_PER_PAGE = 10
-MAX_FINAL_FACTS = 8
 MAX_RETRIES = 2
 MAX_FORMATTED_RESULT_CHARS = 1950
 QUICK_RESULTS = 5
 NORMAL_SOURCES = 2
+DEEP_SOURCES = 4
+DEEP_EXTRACTION_WORKERS = 2
+MAX_DEEP_FACTS = 8
 PAGE_CONTEXT_CHARS = 7_000
 LOCAL_CONTEXT_LIMIT = 8_192
 LLM_INPUT_TOKEN_BUDGET = 6_000
@@ -47,7 +45,7 @@ MESSAGE_TOKEN_OVERHEAD = 128
 MODE_LIMITS = {
     "quick": (0, 15.0),
     "normal": (2, 45.0),
-    "deep": (16, 180.0),
+    "deep": (5, 90.0),
 }
 
 OFFICIAL_DOMAIN_HINTS = {
@@ -111,6 +109,10 @@ NORWAY_MUNICIPALITY_QUERY = re.compile(
     r"(?=.*\b(норвеги\w*|norway)\b)(?=.*\b(коммун\w*|municipalit\w*)\b)",
     re.IGNORECASE,
 )
+NORWAY_LIVING_STANDARD_QUERY = re.compile(
+    r"(?=.*\b(норвеги\w*|norway)\b)(?=.*\b(уровень\s+жизни|living standards?|quality of life)\b)",
+    re.IGNORECASE,
+)
 
 SCHEMA = {
     "type": "function",
@@ -139,31 +141,6 @@ SCHEMA = {
 }
 
 
-class ExtractedFact(BaseModel):
-    claim: str
-    evidence: str = ""
-    date: str = ""
-    entities: list[str] = Field(default_factory=list)
-    relevance: int = Field(default=50, ge=0, le=100)
-
-
-class PageEvidence(BaseModel):
-    source_url: str = ""
-    facts: list[ExtractedFact] = Field(default_factory=list)
-    missing_information: list[str] = Field(default_factory=list)
-
-
-class SynthesisFact(BaseModel):
-    claim: str
-    source_ids: list[int] = Field(default_factory=list)
-
-
-class SearchSynthesis(BaseModel):
-    facts: list[SynthesisFact] = Field(default_factory=list)
-    conflicts: list[str] = Field(default_factory=list)
-    missing_information: list[str] = Field(default_factory=list)
-
-
 class NormalFact(BaseModel):
     claim: str
     evidence: str
@@ -173,6 +150,18 @@ class NormalFact(BaseModel):
 class NormalPageEvidence(BaseModel):
     facts: list[NormalFact]
     insufficient_information: bool
+
+
+class DeepFact(BaseModel):
+    claim: str
+    source_ids: list[int] = Field(default_factory=list)
+    published_at: str = ""
+
+
+class DeepSynthesis(BaseModel):
+    facts: list[DeepFact] = Field(default_factory=list)
+    conflicts: list[str] = Field(default_factory=list)
+    insufficient_information: bool = False
 
 
 StructuredModel = TypeVar("StructuredModel", bound=BaseModel)
@@ -252,6 +241,7 @@ class SearchBudget:
     timeout_seconds: float
     started_at: float = field(default_factory=time.monotonic)
     llm_calls: int = 0
+    lock: Lock = field(default_factory=Lock, repr=False)
 
     @classmethod
     def for_mode(cls, mode: SearchMode) -> "SearchBudget":
@@ -269,13 +259,14 @@ class SearchBudget:
             )
 
     def consume_llm(self) -> int:
-        self.check_deadline()
-        if self.llm_calls >= self.max_llm_calls:
-            raise SearchBudgetExceeded(
-                f"web_search LLM budget exhausted ({self.max_llm_calls})"
-            )
-        self.llm_calls += 1
-        return self.llm_calls
+        with self.lock:
+            self.check_deadline()
+            if self.llm_calls >= self.max_llm_calls:
+                raise SearchBudgetExceeded(
+                    f"web_search LLM budget exhausted ({self.max_llm_calls})"
+                )
+            self.llm_calls += 1
+            return self.llm_calls
 
 
 def _clip(text: str, limit: int) -> str:
@@ -443,48 +434,6 @@ class WebSearchTool:
 
         raise StructuredOutputError(raw, last_error)
 
-    def _optimize_query(self, query: str) -> str:
-        response = self._call_model([{"role": "user", "content":
-            "Convert to a short English search engine query (3-6 keywords, no punctuation).\n"
-            "Reply with ONLY the query in English, nothing else.\n"
-            f"Input: {query}"
-        }], "optimize_query")
-        return (response.choices[0].message.content or "").strip() or query
-
-    def _format_results(self, results: list[dict]) -> str:
-        rows = ""
-        for i, result in enumerate(results):
-            rows += (
-                f"[{i + 1}] {result['title']}\n"
-                f"    URL: {result['href']}\n"
-                f"    Snippet: {result['body']}\n\n"
-            )
-        return rows
-
-    def _pick_relevant(self, formatted: str, results: list[dict]) -> list[int]:
-        prompt = (
-            f"Select up to {MAX_SCRAPE} most informative sources from the list below.\n"
-            "Output ONLY their numbers, comma-separated. No other text.\n"
-            "Example output: 1, 3, 5\n\n"
-            f"Sources ({len(results)} total):\n{formatted}"
-        )
-        response = self._call_model(
-            [{"role": "user", "content": prompt}],
-            "pick_sources",
-        )
-        raw = response.choices[0].message.content or ""
-
-        indices = []
-        for part in raw.split(","):
-            part = part.strip()
-            if part.isdigit():
-                index = int(part)
-                if 1 <= index <= len(results):
-                    indices.append(index - 1)
-        if not indices:
-            indices = list(range(min(MAX_SCRAPE, len(results))))
-        return list(dict.fromkeys(indices))[:MAX_SCRAPE]
-
     def _scrape_trafilatura(self, url: str) -> str:
         try:
             downloaded = trafilatura.fetch_url(url)
@@ -508,170 +457,6 @@ class WebSearchTool:
         if len(text) < 200:
             text = self._scrape_newspaper(url) or text
         return text or "Не удалось извлечь текст."
-
-    def _split_page(self, text: str) -> list[str]:
-        paragraphs = [part.strip() for part in re.split(r"\n\s*\n|\n", text) if part.strip()]
-        chunks: list[str] = []
-        current: list[str] = []
-        current_chars = 0
-
-        for paragraph in paragraphs:
-            pieces = [
-                paragraph[i:i + PAGE_CHUNK_CHARS]
-                for i in range(0, len(paragraph), PAGE_CHUNK_CHARS)
-            ] or [paragraph]
-            for piece in pieces:
-                extra = len(piece) + (2 if current else 0)
-                if current and current_chars + extra > PAGE_CHUNK_CHARS:
-                    chunks.append("\n\n".join(current))
-                    current = []
-                    current_chars = 0
-                current.append(piece)
-                current_chars += len(piece) + (2 if len(current) > 1 else 0)
-        if current:
-            chunks.append("\n\n".join(current))
-
-        if len(chunks) <= MAX_PAGE_CHUNKS:
-            return chunks or [text[:PAGE_CHUNK_CHARS]]
-
-        # Покрываем всю длинную страницу равномерно, а не только её начало.
-        indices = [round(i * (len(chunks) - 1) / (MAX_PAGE_CHUNKS - 1)) for i in range(MAX_PAGE_CHUNKS)]
-        return [chunks[i] for i in dict.fromkeys(indices)]
-
-    def _extract_chunk(self, question: str, url: str, chunk: str,
-                       chunk_number: int, chunk_count: int) -> PageEvidence:
-        prompt = (
-            "Extract only facts that help answer the question from this page fragment. "
-            f"Keep at most {MAX_FACTS_PER_CHUNK} specific facts. Preserve numbers, dates, "
-            "names and a short direct evidence fragment. Do not infer facts absent from the text. "
-            "Use an empty facts list when the fragment is irrelevant.\n\n"
-            f"Question: {question}\nSource: {url}\n"
-            f"Fragment: {chunk_number}/{chunk_count}\n\n{chunk}"
-        )
-        try:
-            evidence = self._structured(prompt, PageEvidence)
-        except StructuredOutputError as error:
-            fallback = _clip(error.raw, 900)
-            evidence = PageEvidence(
-                facts=[ExtractedFact(claim=fallback, relevance=30)] if fallback else [],
-                missing_information=["Structured extraction failed for this fragment"],
-            )
-        except SearchBudgetExceeded as error:
-            evidence = PageEvidence(missing_information=[str(error)])
-        evidence.source_url = url
-        return self._bounded_page(evidence, MAX_FACTS_PER_CHUNK)
-
-    def _bounded_page(self, page: PageEvidence, fact_limit: int) -> PageEvidence:
-        facts = [
-            ExtractedFact(
-                claim=_clip(fact.claim, 350),
-                evidence=_clip(fact.evidence, 250),
-                date=_clip(fact.date, 80),
-                entities=[_clip(entity, 80) for entity in fact.entities[:8]],
-                relevance=fact.relevance,
-            )
-            for fact in sorted(page.facts, key=lambda item: item.relevance, reverse=True)[:fact_limit]
-        ]
-        return PageEvidence(
-            source_url=page.source_url,
-            facts=facts,
-            missing_information=[_clip(item, 160) for item in page.missing_information[:5]],
-        )
-
-    def _merge_page(self, question: str, url: str,
-                    chunks: list[PageEvidence]) -> PageEvidence:
-        if len(chunks) == 1:
-            return chunks[0]
-        merged = chunks[0]
-        for chunk in chunks[1:]:
-            material = json.dumps(
-                [
-                    merged.model_dump(exclude={"source_url"}),
-                    chunk.model_dump(exclude={"source_url"}),
-                ],
-                ensure_ascii=False,
-            )
-            prompt = (
-                f"Incrementally merge evidence from one page for this question: {question}\n"
-                f"Remove duplicates and keep at most {MAX_FACTS_PER_PAGE} strongest supported "
-                "facts. Do not add knowledge. Preserve evidence, dates and entities.\n\n"
-                f"Source: {url}\nEvidence batches: {material}"
-            )
-            try:
-                merged = self._structured(prompt, PageEvidence)
-                merged.source_url = url
-                merged = self._bounded_page(merged, MAX_FACTS_PER_PAGE)
-            except (StructuredOutputError, SearchBudgetExceeded):
-                merged = self._bounded_page(
-                    PageEvidence(
-                        source_url=url,
-                        facts=[*merged.facts, *chunk.facts],
-                        missing_information=[
-                            *merged.missing_information,
-                            *chunk.missing_information,
-                        ],
-                    ),
-                    MAX_FACTS_PER_PAGE,
-                )
-        return merged
-
-    def _extract_page(self, question: str, url: str, content: str) -> PageEvidence:
-        chunks = self._split_page(content)
-        extracted = [
-            self._extract_chunk(question, url, chunk, index + 1, len(chunks))
-            for index, chunk in enumerate(chunks)
-        ]
-        return self._merge_page(question, url, extracted)
-
-    def _fallback_synthesis(self, pages: list[PageEvidence]) -> SearchSynthesis:
-        facts: list[SynthesisFact] = []
-        for source_id, page in enumerate(pages, start=1):
-            for fact in page.facts:
-                facts.append(SynthesisFact(claim=fact.claim, source_ids=[source_id]))
-                if len(facts) >= MAX_FINAL_FACTS:
-                    return SearchSynthesis(facts=facts)
-        return SearchSynthesis(facts=facts)
-
-    def _synthesize(self, question: str, pages: list[PageEvidence]) -> SearchSynthesis:
-        material = json.dumps(
-            [self._bounded_page(page, MAX_FACTS_PER_PAGE).model_dump() for page in pages],
-            ensure_ascii=False,
-        )
-        prompt = (
-            f"Combine evidence from multiple web sources for this question: {question}\n"
-            f"Return at most {MAX_FINAL_FACTS} concise answer-ready facts. Merge duplicates, list "
-            "every supporting source number, and keep source disagreements in conflicts. "
-            "Do not invent or resolve conflicts without evidence. Source IDs are 1-based in the "
-            f"order below.\n\nSources: {material}"
-        )
-        try:
-            return self._structured(prompt, SearchSynthesis)
-        except (StructuredOutputError, SearchBudgetExceeded):
-            return self._fallback_synthesis(pages)
-
-    def _format_synthesis(self, synthesis: SearchSynthesis,
-                          pages: list[PageEvidence]) -> str:
-        lines = ["Sources:"]
-        lines.extend(
-            f"[{index}] {_clip(page.source_url, 180)}"
-            for index, page in enumerate(pages, start=1)
-        )
-        lines.append("\nFacts:")
-        for fact in synthesis.facts[:MAX_FINAL_FACTS]:
-            valid_ids = sorted({i for i in fact.source_ids if 1 <= i <= len(pages)})
-            citations = ",".join(str(i) for i in valid_ids)
-            suffix = f" [{citations}]" if citations else ""
-            lines.append(f"- {_clip(fact.claim, 190)}{suffix}")
-        if synthesis.conflicts:
-            lines.append("\nConflicts:")
-            lines.extend(f"- {_clip(item, 240)}" for item in synthesis.conflicts[:3])
-        if synthesis.missing_information:
-            lines.append("\nMissing information:")
-            lines.extend(f"- {_clip(item, 200)}" for item in synthesis.missing_information[:3])
-        result = "\n".join(lines)
-        if len(result) > MAX_FORMATTED_RESULT_CHARS:
-            return result[:MAX_FORMATTED_RESULT_CHARS - 1] + "…"
-        return result
 
     def _search(self, query: str) -> list[dict]:
         started = time.monotonic()
@@ -756,6 +541,9 @@ class WebSearchTool:
             normalized = "current number of municipalities Norway official statistics"
             freshness = True
             expected = ExpectedValue.NUMBER
+        elif NORWAY_LIVING_STANDARD_QUERY.search(query):
+            normalized = "Norway standard of living quality of life latest statistics"
+            freshness = True
         elif expected == ExpectedValue.WEATHER:
             location = re.search(
                 r"(?:погод\w*|температур\w*)(?:\s+сейчас)?\s+в\s+(.+)",
@@ -1221,6 +1009,130 @@ class WebSearchTool:
         ]
         return self._format_normal_results(selected, pages)
 
+    def _fallback_deep_synthesis(self, pages: list[NormalPageEvidence]) -> DeepSynthesis:
+        facts: list[DeepFact] = []
+        for source_id, page in enumerate(pages, start=1):
+            for fact in page.facts:
+                facts.append(DeepFact(
+                    claim=fact.claim,
+                    source_ids=[source_id],
+                    published_at=fact.published_at,
+                ))
+                if len(facts) >= MAX_DEEP_FACTS:
+                    return DeepSynthesis(facts=facts)
+        return DeepSynthesis(facts=facts, insufficient_information=not facts)
+
+    def _synthesize_deep(self, question: str,
+                         pages: list[NormalPageEvidence]) -> DeepSynthesis:
+        material = json.dumps([
+            {
+                "source_id": source_id,
+                "facts": [fact.model_dump() for fact in page.facts],
+            }
+            for source_id, page in enumerate(pages, start=1)
+        ], ensure_ascii=False)
+        prompt = (
+            f"Verify and combine evidence for this research question: {question}\n"
+            f"Return at most {MAX_DEEP_FACTS} concise facts. Merge duplicates, preserve every "
+            "supporting source_id, keep dates, and list genuine source disagreements in "
+            "conflicts. Do not add outside knowledge. Source IDs are 1-based.\n\n"
+            f"Evidence: {material}"
+        )
+        try:
+            synthesis = self._structured(prompt, DeepSynthesis, max_attempts=1)
+        except (StructuredOutputError, SearchBudgetExceeded):
+            return self._fallback_deep_synthesis(pages)
+        valid_facts = []
+        for fact in synthesis.facts[:MAX_DEEP_FACTS]:
+            source_ids = sorted({
+                source_id for source_id in fact.source_ids
+                if 1 <= source_id <= len(pages)
+            })
+            if fact.claim and source_ids:
+                valid_facts.append(DeepFact(
+                    claim=_clip(fact.claim, 300),
+                    source_ids=source_ids,
+                    published_at=_clip(fact.published_at, 40),
+                ))
+        return DeepSynthesis(
+            facts=valid_facts,
+            conflicts=[_clip(conflict, 240) for conflict in synthesis.conflicts[:4]],
+            insufficient_information=synthesis.insufficient_information or not valid_facts,
+        )
+
+    def _format_deep_results(self, results: list[dict],
+                             synthesis: DeepSynthesis) -> str:
+        lines = ["Deep web evidence:", "Sources:"]
+        for source_id, result in enumerate(results, start=1):
+            host = urlparse(result.get("href", "")).hostname or ""
+            official = bool(
+                self.last_intent
+                and self.last_intent.official_domain
+                and host.endswith(self.last_intent.official_domain)
+            )
+            year = self._source_year(result)
+            metadata = f"official={'yes' if official else 'no'}"
+            if year:
+                metadata += f", year={year}"
+            lines.append(
+                f"[{source_id}] {_clip(result.get('title', ''), 120)} | {metadata}\n"
+                f"    {_clip(result.get('href', ''), 180)}"
+            )
+        lines.append("\nVerified facts:")
+        for fact in synthesis.facts[:MAX_DEEP_FACTS]:
+            citations = ",".join(str(source_id) for source_id in fact.source_ids)
+            date = f" ({fact.published_at})" if fact.published_at else ""
+            lines.append(f"- {_clip(fact.claim, 220)}{date} [{citations}]")
+        if synthesis.conflicts:
+            lines.append("\nConflicts:")
+            lines.extend(f"- {_clip(conflict, 220)}" for conflict in synthesis.conflicts[:4])
+        if synthesis.insufficient_information and not synthesis.facts:
+            lines.append("- Insufficient supported information.")
+        formatted = "\n".join(lines)
+        if len(formatted) > MAX_FORMATTED_RESULT_CHARS:
+            return formatted[:MAX_FORMATTED_RESULT_CHARS - 1] + "…"
+        return formatted
+
+    def _run_deep(self, query: str, results: list[dict]) -> str:
+        intent = self.last_intent or self._analyze_intent(query)
+        selected = self._rank_results(intent, results)[:DEEP_SOURCES]
+        self._log(
+            "stage=select_sources | mode=deep | "
+            + " | ".join(
+                f"rank={index + 1},url={_clip(result.get('href', ''), 120)}"
+                for index, result in enumerate(selected)
+            )
+        )
+        scraped = self._fetch_pages(selected)
+        started = time.monotonic()
+        pages: list[NormalPageEvidence | None] = [None] * len(selected)
+        workers = min(DEEP_EXTRACTION_WORKERS, len(selected))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(
+                    self._extract_normal_page,
+                    query,
+                    result,
+                    scraped[result["href"]],
+                ): index
+                for index, result in enumerate(selected)
+            }
+            for future in as_completed(futures):
+                pages[futures[future]] = future.result()
+        extracted = [
+            page if page is not None else NormalPageEvidence(
+                facts=[],
+                insufficient_information=True,
+            )
+            for page in pages
+        ]
+        self._log(
+            f"stage=extract_pages | mode=deep | pages={len(extracted)} | "
+            f"workers={workers} | elapsed={time.monotonic() - started:.2f}s"
+        )
+        synthesis = self._synthesize_deep(query, extracted)
+        return self._format_deep_results(selected, synthesis)
+
     def execute(self, query: str, depth: str = "auto") -> str:
         mode = self._select_mode(query, depth)
         initial_mode = mode
@@ -1280,25 +1192,7 @@ class WebSearchTool:
             results = self._search(self.last_query)
             if not results:
                 return "Ничего не найдено."
-
-            indices = self._pick_relevant(self._format_results(results), results)
-            urls = [results[index]["href"] for index in indices]
-
-            fetch_started = time.monotonic()
-            scraped: dict[str, str] = {}
-            with ThreadPoolExecutor(max_workers=len(urls)) as executor:
-                futures = {executor.submit(self._scrape, url): url for url in urls}
-                for future in as_completed(futures):
-                    scraped[futures[future]] = future.result()
-            budget.check_deadline()
-            self._log(
-                f"stage=fetch | pages={len(urls)} | "
-                f"elapsed={time.monotonic() - fetch_started:.2f}s"
-            )
-
-            pages = [self._extract_page(query, url, scraped[url]) for url in urls]
-            synthesis = self._synthesize(query, pages)
-            return self._format_synthesis(synthesis, pages)
+            return self._run_deep(query, results)
         except SearchBudgetExceeded as error:
             self._log(f"stopped | reason={error}")
             return f"Поиск остановлен: {error}"

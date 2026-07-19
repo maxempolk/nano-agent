@@ -48,6 +48,12 @@ DEEP_SEARCH_INTENT = re.compile(
     r"deep research|in-depth|compare|comparison|research)\b",
     re.IGNORECASE,
 )
+FORCED_DEEP_WEB_SEARCH = re.compile(
+    r"(?:\b(?:подробн\w*|глубок\w*)\b.{0,30}\b(?:исслед\w*|изуч\w*|"
+    r"проанализ\w*)\b|\bисследуй\b|\bсравни\w*\b.{0,45}\bисточник\w*\b|"
+    r"\bdeep research\b|\bin-depth research\b)",
+    re.IGNORECASE,
+)
 
 
 def _message_dict(message) -> dict:
@@ -79,9 +85,17 @@ def _truncate(text: str, max_chars: int) -> str:
 def _forced_web_search_query(user_input: str, previous_user_input: str | None = None) -> str | None:
     if GENERIC_SEARCH_FOLLOWUP.match(user_input):
         return previous_user_input or user_input
-    if EXPLICIT_WEB_SEARCH.search(user_input) or CHANGING_WEB_FACT.search(user_input):
+    if (
+        EXPLICIT_WEB_SEARCH.search(user_input)
+        or CHANGING_WEB_FACT.search(user_input)
+        or FORCED_DEEP_WEB_SEARCH.search(user_input)
+    ):
         return user_input
     return None
+
+
+def _forced_web_search_depth(user_input: str) -> str:
+    return "deep" if FORCED_DEEP_WEB_SEARCH.search(user_input) else "auto"
 
 
 def _without_tool(tools: list, name: str) -> list:
@@ -282,7 +296,10 @@ class Agent:
         search_query = _forced_web_search_query(user_input, previous_user_input)
         web_handler = self.handlers.get("web_search")
         if search_query and web_handler:
-            args = {"query": search_query, "depth": "auto"}
+            args = {
+                "query": search_query,
+                "depth": _forced_web_search_depth(user_input),
+            }
             arguments = json.dumps(args, ensure_ascii=False)
             call_id = f"forced-web-search-{len(self.messages)}"
             if self.logger:
@@ -376,8 +393,66 @@ class Agent:
                     return reply
 
                 self.messages.append(message)  # type: ignore
+                first_web_call_id = next(
+                    (
+                        call.id
+                        for call in message.tool_calls
+                        if call.function.name == "web_search"
+                    ),
+                    None,
+                )
+                if first_web_call_id:
+                    # Один пакет AFM может содержать несколько поисков и curl.
+                    # Даже невалидный первый вызов не должен открывать новый
+                    # цикл инструментов.
+                    turn_tools = []
                 for call in message.tool_calls:
-                    args = json.loads(call.function.arguments)  # type: ignore
+                    if tool_calls_made >= MAX_TOOL_CALLS_PER_TURN:
+                        result = "Пропущено: достигнут лимит инструментов за один ход."
+                        self.messages.append({
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": result,
+                        })
+                        continue
+
+                    if first_web_call_id and call.id != first_web_call_id:
+                        result = (
+                            "Пропущено: в пакете с web_search выполняется только "
+                            "первый поиск; остальные инструменты заблокированы."
+                        )
+                        if self.logger:
+                            self.logger.info(
+                                f"tool skipped after batched web_search | "
+                                f"name={call.function.name}"
+                            )
+                        self.messages.append({
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": result,
+                        })
+                        continue
+
+                    try:
+                        args = json.loads(call.function.arguments or "{}")  # type: ignore
+                        if not isinstance(args, dict):
+                            raise ValueError("arguments must be a JSON object")
+                    except (json.JSONDecodeError, ValueError) as error:
+                        args = {}
+                        result = (
+                            f"Ошибка аргументов инструмента {call.function.name}: {error}"
+                        )
+                        if self.logger:
+                            self.logger.info(
+                                f"invalid tool arguments | name={call.function.name}"
+                            )
+                        self.messages.append({
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": result,
+                        })
+                        tool_calls_made += 1
+                        continue
                     if (
                         call.function.name == "web_search"
                         and args.get("depth") == "deep"
@@ -401,7 +476,9 @@ class Agent:
                     if call.function.name == "web_search":
                         tool_obj = self.tool_objects.get("web_search")
                         self.last_search_query = getattr(tool_obj, "last_query", args.get("query"))
-                        turn_tools = _without_tool(turn_tools, "web_search")
+                        # После поиска AFM должна сформировать ответ из результата,
+                        # а не повторять поиск или открывать URL через bash.
+                        turn_tools = []
 
                     if self.logger:
                         self.logger.tool_call(
