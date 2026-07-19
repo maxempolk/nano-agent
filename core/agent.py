@@ -113,18 +113,25 @@ def _tool_names(tools: list) -> set[str]:
     }
 
 
-def _finalization_messages(context_messages: list, user_input: str,
+FINALIZER_SYSTEM = (
+    "You write a reader-facing answer from completed research using only supplied evidence. "
+    "Answer in the user's language. Start with a concise overall conclusion, then cover the "
+    "requested aspects with Markdown headings or bullets. Compare sources, explain genuine "
+    "conflicts, and state evidence gaps. Preserve source references and URLs. "
+    "If evidence says Broad conclusion allowed: no, begin by saying the research is partial, "
+    "identify missing aspects, and do not make an overall quality or winner judgment. "
+    "Return normal prose only: never emit JSON, a key-value schema, a code fence, a function call, or an "
+    "empty response."
+)
+
+
+def _finalization_messages(user_input: str,
                            evidence: list[tuple[str, str]]) -> list[dict]:
-    system = _message_dict(context_messages[0]).get("content", "")
-    system += (
-        "\n\nReturn the final answer now. Use the supplied tool evidence, do not call or "
-        "describe tools, and write normal prose rather than JSON. Never return an empty answer."
-    )
     evidence_text = "\n\n".join(
-        f"[{name}]\n{result}" for name, result in evidence
+        result for _, result in evidence
     )
     return [
-        {"role": "system", "content": system},
+        {"role": "system", "content": FINALIZER_SYSTEM},
         {
             "role": "user",
             "content": (
@@ -135,7 +142,12 @@ def _finalization_messages(context_messages: list, user_input: str,
     ]
 
 
-def _tool_evidence_fallback(evidence: list[tuple[str, str]]) -> str:
+def _tool_evidence_fallback(evidence: list[tuple[str, str]],
+                            structured_result=None) -> str:
+    if structured_result is not None and hasattr(structured_result, "render_fallback"):
+        rendered = structured_result.render_fallback()
+        if rendered.strip():
+            return rendered
     if not evidence:
         return "Не удалось сформировать ответ: модель вернула пустой результат."
     name, result = evidence[-1]
@@ -146,6 +158,34 @@ def _tool_evidence_fallback(evidence: list[tuple[str, str]]) -> str:
         "Не удалось сформировать итоговый текст модели. Ниже — результат "
         f"инструмента {name}:\n\n{result}"
     )
+
+
+def _validate_final_answer(content: str, user_input: str,
+                           require_partial: bool = False) -> tuple[bool, str]:
+    text = content.strip()
+    if not text:
+        return False, "empty"
+    if text.startswith("```"):
+        return False, "code_fence"
+    try:
+        decoded = json.loads(text)
+    except json.JSONDecodeError:
+        decoded = None
+    if isinstance(decoded, (dict, list)):
+        return False, "json"
+    if require_partial and not re.search(
+        r"частич|недостаточ|не удалось|пробел|отсутств|partial|insufficient|missing|gap|could not",
+        text,
+        re.IGNORECASE,
+    ):
+        return False, "partial_coverage_hidden"
+    if re.search(r"[а-яё]", user_input, re.IGNORECASE):
+        cyrillic_chars = re.findall(r"[а-яё]", text, re.IGNORECASE)
+        prose = re.sub(r"https?://\S+", "", text)
+        prose = re.sub(r"\b[A-Z0-9][A-Z0-9._-]*\b", "", prose)
+        if len(cyrillic_chars) < 5 and re.search(r"\b[A-Za-z]{3,}\b", prose):
+            return False, "language_mismatch"
+    return True, "ok"
 
 
 class Agent:
@@ -318,6 +358,54 @@ class Agent:
             )
         return True
 
+    def _finalize_research(self, user_input: str,
+                           evidence: list[tuple[str, str]]) -> str:
+        messages = _finalization_messages(user_input, evidence)
+        web_tool = self.tool_objects.get("web_search")
+        structured_result = (
+            getattr(web_tool, "last_result", None)
+            if any(name == "web_search" for name, _ in evidence)
+            else None
+        )
+        require_partial = bool(
+            structured_result is not None
+            and not getattr(structured_result, "broad_conclusion_allowed", True)
+        )
+        models = list(dict.fromkeys(filter(None, [self.model, self.model_fallback])))
+        for attempt, model in enumerate(models, start=1):
+            if self.logger:
+                self.logger.info(
+                    f"finalizer | start | attempt={attempt}/{len(models)} | model={model}"
+                )
+            try:
+                response = call_llm(self.client, model, messages)
+                message = response.choices[0].message
+                finish_reason = response.choices[0].finish_reason
+                content = (message.content or "").strip()
+                tool_calls = len(message.tool_calls) if message.tool_calls else 0
+                if self.logger:
+                    self.logger.info(
+                        f"finalizer | end | model={model} | finish_reason={finish_reason} | "
+                        f"tool_calls={tool_calls} | content_len={len(content)}"
+                    )
+                valid, reason = _validate_final_answer(
+                    content, user_input, require_partial=require_partial
+                )
+                if valid and not message.tool_calls:
+                    return content
+                if self.logger:
+                    self.logger.error(
+                        f"finalizer rejected | model={model} | reason="
+                        f"{'tool_calls' if message.tool_calls else reason}"
+                    )
+            except Exception as error:
+                if self.logger:
+                    self.logger.error(f"finalizer failed | model={model} | error={error}")
+
+        if self.logger:
+            self.logger.error("finalizer | deterministic_fallback")
+        return _tool_evidence_fallback(evidence, structured_result)
+
     def run_turn(self, user_input: str, on_tool_call=None) -> str:
         self._select_route(user_input)
         previous_user_input = next(
@@ -336,7 +424,6 @@ class Agent:
         tool_calls_made = 0
         turn_tools = self.tools
         search_completed = False
-        protocol_retry_used = False
         turn_evidence: list[tuple[str, str]] = []
 
         search_query = _forced_web_search_query(user_input, previous_user_input)
@@ -362,7 +449,14 @@ class Agent:
                 self.logger.tool_result(result)
             if on_tool_call:
                 on_tool_call("web_search", arguments, result)
-            turn_evidence.append(("web_search", result))
+            structured_result = getattr(tool_obj, "last_result", None)
+            evidence_result = (
+                structured_result.evidence_text()
+                if structured_result is not None
+                and hasattr(structured_result, "evidence_text")
+                else result
+            )
+            turn_evidence.append(("web_search", evidence_result))
 
             self.messages.extend([
                 {
@@ -385,6 +479,13 @@ class Agent:
         while True:
             self._compact_if_needed()
             windowed = self._context_messages()
+
+            if search_completed:
+                reply = self._finalize_research(user_input, turn_evidence)
+                self.messages.append({"role": "assistant", "content": reply})
+                if self.logger:
+                    self.logger.agent(reply)
+                return reply
 
             try:
                 response = call_llm(self.client, self.model, windowed, turn_tools)  # type: ignore
@@ -449,40 +550,7 @@ class Agent:
                             f"returned={names} | allowed={','.join(sorted(allowed_tools)) or '-'} | "
                             f"search_completed={str(search_completed).lower()}"
                         )
-                    if not protocol_retry_used:
-                        protocol_retry_used = True
-                        recovery_messages = _finalization_messages(
-                            windowed, user_input, turn_evidence
-                        )
-                        if self.logger:
-                            self.logger.info(
-                                "tool protocol recovery | start | "
-                                f"model={self.model} | evidence={len(turn_evidence)}"
-                            )
-                        try:
-                            response = call_llm(
-                                self.client, self.model, recovery_messages, []
-                            )  # type: ignore
-                            message = response.choices[0].message
-                            finish_reason = response.choices[0].finish_reason
-                            if self.logger:
-                                self.logger.info(
-                                    "tool protocol recovery | end | "
-                                    f"finish_reason={finish_reason} | "
-                                    f"tool_calls={len(message.tool_calls) if message.tool_calls else 0} | "
-                                    f"content_len={len(message.content or '')}"
-                                )
-                        except Exception as error:
-                            if self.logger:
-                                self.logger.error(f"tool protocol recovery failed: {error}")
-                            message = None
-                        if message and not message.tool_calls and (message.content or "").strip():
-                            reply = (message.content or "").strip()
-                            self.messages.append({"role": "assistant", "content": reply})
-                            if self.logger:
-                                self.logger.agent(reply)
-                            return reply
-                    reply = _tool_evidence_fallback(turn_evidence)
+                    reply = self._finalize_research(user_input, turn_evidence)
                     self.messages.append({"role": "assistant", "content": reply})
                     if self.logger:
                         self.logger.error(reply)
@@ -596,7 +664,14 @@ class Agent:
                             json.dumps(args, ensure_ascii=False),
                             result,
                         )
-                    turn_evidence.append((call.function.name, result))
+                    evidence_result = result
+                    if call.function.name == "web_search":
+                        structured_result = getattr(tool_obj, "last_result", None)
+                        if structured_result is not None and hasattr(
+                            structured_result, "evidence_text"
+                        ):
+                            evidence_result = structured_result.evidence_text()
+                    turn_evidence.append((call.function.name, evidence_result))
 
                     self.messages.append({
                         "role": "tool",

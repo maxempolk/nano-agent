@@ -7,11 +7,37 @@ from interfaces.telegram import (
     _deliver_final,
     _format_tool_trace,
     _messages_with_tool_trace,
+    _markdown_to_telegram_html,
     _progress_message,
+    _telegram_post,
 )
 
 
 class TelegramContextCommandTests(TestCase):
+    def test_markdown_is_rendered_as_safe_telegram_html(self):
+        rendered = _markdown_to_telegram_html(
+            "### Вывод\n\n**Важно:** данные [SSB](https://ssb.no?a=1&b=2).\n"
+            "- Значение `118 307 NOK`\n<script>"
+        )
+
+        self.assertIn("<b>Вывод</b>", rendered)
+        self.assertIn("<b>Важно:</b>", rendered)
+        self.assertIn('<a href="https://ssb.no?a=1&amp;b=2">SSB</a>', rendered)
+        self.assertIn("• Значение <code>118 307 NOK</code>", rendered)
+        self.assertIn("&lt;script&gt;", rendered)
+        self.assertNotIn("###", rendered)
+        self.assertNotIn("**", rendered)
+
+    def test_fenced_code_becomes_telegram_pre_block(self):
+        rendered = _markdown_to_telegram_html(
+            "```python\nprint(\"<ok>\")\n```"
+        )
+
+        self.assertEqual(
+            rendered,
+            "<pre><code>print(&quot;&lt;ok&gt;&quot;)</code></pre>",
+        )
+
     def test_command_with_bot_name(self):
         self.assertEqual(_command_name("/context@my_bot"), "/context")
         self.assertEqual(_command_name("/compact now"), "/compact")
@@ -79,6 +105,22 @@ class TelegramContextCommandTests(TestCase):
         self.assertIn("<blockquote expandable>", trace)
         self.assertIn("web_search", trace)
         self.assertLess(len(trace), 1000)
+
+    def test_successful_telegram_delivery_is_logged(self):
+        response = Mock()
+        response.json.return_value = {
+            "ok": True,
+            "result": {"message_id": 321},
+        }
+        logger = Mock()
+
+        with patch("interfaces.telegram.httpx.post", return_value=response):
+            payload = _telegram_post("base", "sendMessage", {"text": "hi"}, logger)
+
+        self.assertTrue(payload["ok"])
+        logger.info.assert_called_once_with(
+            "Telegram sendMessage ok | message_id=321"
+        )
 
     def test_final_replaces_progress_message_then_sends_overflow(self):
         with patch("interfaces.telegram._edit_message", return_value=True) as edit, \

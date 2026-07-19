@@ -4,6 +4,8 @@ from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
 from core.tools.web_search import (
+    AspectStatus,
+    ConflictAssessment,
     DeepFact,
     DeepSynthesis,
     ExpectedValue,
@@ -12,11 +14,15 @@ from core.tools.web_search import (
     NormalFact,
     NormalPageEvidence,
     PAGE_CONTEXT_CHARS,
+    PlannedQuery,
+    ResearchResult,
+    ResearchSource,
     SearchBudget,
     SearchBudgetExceeded,
     SearchIntent,
     SearchMode,
     ResearchPlan,
+    ResearchAspect,
     WebSearchTool,
     _estimate_input_tokens,
     _flat_json_schema,
@@ -129,6 +135,26 @@ class WebSearchStructuredTests(TestCase):
 
         self.assertLessEqual(len(result), MAX_FORMATTED_RESULT_CHARS)
         self.assertIn("[1]", result)
+
+    def test_structured_research_result_has_readable_russian_fallback(self):
+        result = ResearchResult(
+            query="исследуй уровень жизни",
+            mode="deep",
+            sources=[ResearchSource(
+                source_id=1,
+                title="Official statistics",
+                url="https://example.test/statistics",
+                official=True,
+            )],
+            facts=[DeepFact(claim="Подтверждённый факт", source_ids=[1])],
+            coverage_gaps=["безопасность"],
+        )
+
+        rendered = result.render_fallback()
+
+        self.assertIn("Подтверждённый факт [1]", rendered)
+        self.assertIn("Не удалось надёжно проверить", rendered)
+        self.assertIn("https://example.test/statistics", rendered)
 
     def test_execute_processes_each_selected_page_separately(self):
         results = [
@@ -533,6 +559,33 @@ class WebSearchStructuredTests(TestCase):
             "https://www.ssb.no/survey",
         ))
 
+    def test_fact_filter_rejects_absence_statements(self):
+        intent = SearchIntent(
+            original_query="Norway income",
+            normalized_query="Norway income",
+            expected_value=ExpectedValue.FACT,
+            requires_freshness=True,
+            official_requested=False,
+            official_domain=None,
+        )
+
+        self.assertFalse(self.tool._fact_matches_intent(
+            intent,
+            NormalFact(
+                claim="Information about incomes is absent.",
+                evidence="The page does not provide relevant information.",
+            ),
+        ))
+
+    def test_pdf_scraper_uses_pdftotext_path_before_html_extractors(self):
+        with patch.object(self.tool, "_scrape_pdf", return_value="x" * 300) as pdf, \
+             patch.object(self.tool, "_scrape_trafilatura") as html:
+            content = self.tool._scrape("https://example.test/report.pdf")
+
+        self.assertEqual(content, "x" * 300)
+        pdf.assert_called_once()
+        html.assert_not_called()
+
     def test_research_ranking_demotes_clearly_stale_official_page(self):
         intent = SearchIntent(
             original_query="income research",
@@ -587,6 +640,42 @@ class WebSearchStructuredTests(TestCase):
         for aspect in ("income", "housing", "safety", "satisfaction"):
             self.assertIn(aspect, selected_text)
 
+    def test_deep_selection_excludes_template_site_when_research_source_exists(self):
+        intent = SearchIntent(
+            original_query="Norway life satisfaction",
+            normalized_query="Norway life satisfaction",
+            expected_value=ExpectedValue.FACT,
+            requires_freshness=True,
+            official_requested=False,
+            official_domain=None,
+            subject="Norway",
+        )
+        self.tool.last_plan = ResearchPlan(queries=[PlannedQuery(
+            query="Norway life satisfaction",
+            aspect="life satisfaction",
+        )])
+        results = [
+            {
+                "title": "Life Satisfaction Survey Template",
+                "href": "https://www.jotform.com/form-templates/life-satisfaction",
+                "body": "life satisfaction survey form",
+                "_plan_query": 0,
+            },
+            {
+                "title": "Life satisfaction in Norway 2025",
+                "href": "https://www.ssb.no/en/life-satisfaction",
+                "body": "official life satisfaction statistics",
+                "_plan_query": 0,
+            },
+        ]
+
+        selected = self.tool._select_deep_sources(
+            intent, results, ["life satisfaction"]
+        )
+
+        self.assertEqual(selected[0]["href"], "https://www.ssb.no/en/life-satisfaction")
+        self.assertFalse(any("jotform.com" in item["href"] for item in selected))
+
     def test_deep_replaces_unreadable_source_before_extraction(self):
         intent = SearchIntent(
             original_query="Norway income",
@@ -619,6 +708,40 @@ class WebSearchStructuredTests(TestCase):
 
         self.assertEqual(selected[0], replacement)
         self.assertEqual(scraped[replacement["href"]], "x" * 300)
+
+    def test_deep_replaces_source_that_extracts_no_facts(self):
+        broken = {
+            "title": "Broken safety page",
+            "href": "https://broken.test/safety",
+            "body": "safety",
+            "_plan_query": 0,
+        }
+        replacement = {
+            "title": "Crime and safety statistics",
+            "href": "https://www.ssb.no/en/safety",
+            "body": "crime safety statistics",
+            "_plan_query": 0,
+        }
+        selected = [broken]
+        pages = [NormalPageEvidence(facts=[], insufficient_information=True)]
+        replacement_page = NormalPageEvidence(
+            facts=[NormalFact(
+                claim="Crime declined",
+                evidence="Official statistics",
+            )],
+            insufficient_information=False,
+        )
+
+        with patch.object(self.tool, "_scrape", return_value="x" * 300), \
+             patch.object(
+                 self.tool, "_extract_normal_page", return_value=replacement_page
+             ):
+            self.tool._replace_empty_extractions(
+                "Norway safety", selected, [broken, replacement], {}, pages
+            )
+
+        self.assertEqual(selected[0], replacement)
+        self.assertEqual(pages[0], replacement_page)
 
     def test_deep_reports_requested_aspects_missing_from_evidence(self):
         pages = [NormalPageEvidence(
@@ -764,7 +887,10 @@ class WebSearchStructuredTests(TestCase):
         self.assertEqual(extract.call_count, 5)
         synthesize.assert_called_once()
         self.assertIn("verified", result)
-        self.assertEqual(self.tool.last_stats["max_llm_calls"], 7)
+        self.assertEqual(self.tool.last_stats["max_llm_calls"], 8)
+        self.assertIsNotNone(self.tool.last_result)
+        self.assertEqual(self.tool.last_result.mode, "deep")
+        self.assertEqual(self.tool.last_result.facts[0].claim, "verified")
 
     def test_deep_parallel_extraction_preserves_ranked_source_order(self):
         results = [
@@ -840,6 +966,23 @@ class WebSearchStructuredTests(TestCase):
         self.assertFalse(recovered.insufficient_information)
         self.assertEqual(recovered.facts[0].claim, "GPT-5.6 is current")
 
+    def test_normal_recovers_nested_claim_and_properties_shape(self):
+        raw = (
+            '{"properties":[{"facts":[{"claim":{'
+            '"title":"Work conditions are generally safe in Norway",'
+            '"evidence":"Most people work under good and safe conditions.",'
+            '"published_at":"19/12/2024"},"type":"NormalFact"}]}]}'
+        )
+
+        recovered = self.tool._recover_normal_evidence(raw)
+
+        self.assertEqual(len(recovered.facts), 1)
+        self.assertEqual(
+            recovered.facts[0].claim,
+            "Work conditions are generally safe in Norway",
+        )
+        self.assertEqual(recovered.facts[0].published_at, "19/12/2024")
+
     def test_normal_recovers_complete_pairs_from_truncated_json(self):
         raw = (
             '{"facts":[{"claim":"first","evidence":"quote one"},'
@@ -881,3 +1024,81 @@ class WebSearchStructuredTests(TestCase):
 
         with self.assertRaises(SearchBudgetExceeded):
             budget.check_deadline()
+
+    def test_universal_aspect_contracts_cover_unrelated_task_classes(self):
+        tasks = [
+            ("country", "income and safety", "official statistics"),
+            ("phone", "camera and battery", "laboratory measurements"),
+            ("software", "API compatibility", "official documentation"),
+            ("law", "exceptions and effective date", "primary legislation"),
+            ("science", "competing positions", "peer reviewed studies"),
+        ]
+        for name, requirement, source_type in tasks:
+            with self.subTest(task=name):
+                aspect = ResearchAspect(
+                    name=name,
+                    query=f"test {name}",
+                    requirement=requirement,
+                    preferred_source_type=source_type,
+                    acceptance_criteria=f"Evidence directly covers {requirement}",
+                )
+                self.assertEqual(aspect.requirement, requirement)
+                self.assertNotEqual(aspect.acceptance_criteria, "")
+
+    def test_aspect_outcomes_require_bound_relevant_evidence(self):
+        aspects = [
+            ResearchAspect(name="camera", query="camera", requirement="camera quality"),
+            ResearchAspect(name="battery", query="battery", requirement="battery endurance"),
+        ]
+        selected = [
+            {"_aspect_name": "camera"},
+            {"_aspect_name": "battery"},
+        ]
+        pages = [
+            NormalPageEvidence(
+                facts=[NormalFact(claim="Camera resolves detail", evidence="Measured chart")],
+                insufficient_information=False,
+                answers_aspect=True,
+                relevance_score=90,
+            ),
+            NormalPageEvidence(
+                facts=[],
+                insufficient_information=True,
+                answers_aspect=False,
+                relevance_score=20,
+                rejection_reason="Only charging accessories are discussed",
+            ),
+        ]
+
+        outcomes = self.tool._aspect_outcomes(aspects, selected, pages)
+
+        self.assertEqual(outcomes[0].status, AspectStatus.CONFIRMED)
+        self.assertEqual(outcomes[1].status, AspectStatus.REJECTED)
+        self.assertIn("accessories", outcomes[1].failure_reason)
+
+    def test_different_dates_are_not_a_conflict(self):
+        conflict = ConflictAssessment(
+            description="Sources report different years",
+            source_ids=[1, 2],
+            metric="population",
+            unit="people",
+            period="2024 versus 2025",
+            geography="same country",
+            definition="resident population",
+        )
+        self.assertFalse(self.tool._valid_conflict(conflict, 2))
+
+    def test_conflict_requires_compatible_comparison_metadata(self):
+        valid = ConflictAssessment(
+            description="Two sources give incompatible values",
+            source_ids=[1, 2],
+            metric="battery endurance",
+            unit="hours",
+            period="same test run",
+            geography="same market",
+            definition="continuous web browsing",
+        )
+        missing_definition = valid.model_copy(update={"definition": ""})
+
+        self.assertTrue(self.tool._valid_conflict(valid, 2))
+        self.assertFalse(self.tool._valid_conflict(missing_definition, 2))

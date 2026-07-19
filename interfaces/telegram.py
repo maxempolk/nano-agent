@@ -1,6 +1,7 @@
 from __future__ import annotations
 from html import escape
 import json
+import re
 import time
 import httpx
 from urllib.parse import quote_plus
@@ -19,6 +20,76 @@ def _shorten(text: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return text[:limit] + f"\n… [ещё {len(text) - limit} символов]"
+
+
+def _inline_markdown_to_html(text: str) -> str:
+    placeholders: dict[str, str] = {}
+
+    def stash(value: str) -> str:
+        token = f"\x00{len(placeholders)}\x00"
+        placeholders[token] = value
+        return token
+
+    text = re.sub(
+        r"`([^`\n]+)`",
+        lambda match: stash(f"<code>{escape(match.group(1))}</code>"),
+        text,
+    )
+    text = re.sub(
+        r"\[([^\]]+)\]\((https?://[^)\s]+)\)",
+        lambda match: stash(
+            f'<a href="{escape(match.group(2), quote=True)}">'
+            f"{escape(match.group(1))}</a>"
+        ),
+        text,
+    )
+    text = escape(text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
+    text = re.sub(r"__(.+?)__", r"<b>\1</b>", text)
+    text = re.sub(r"(?<!\*)\*([^*\n]+)\*(?!\*)", r"<i>\1</i>", text)
+    for token, value in placeholders.items():
+        text = text.replace(token, value)
+    return text
+
+
+def _markdown_to_telegram_html(markdown: str) -> str:
+    lines = markdown.splitlines()
+    output: list[str] = []
+    code_lines: list[str] | None = None
+
+    for line in lines:
+        if line.strip().startswith("```"):
+            if code_lines is None:
+                code_lines = []
+            else:
+                output.append(
+                    f"<pre><code>{escape(chr(10).join(code_lines))}</code></pre>"
+                )
+                code_lines = None
+            continue
+        if code_lines is not None:
+            code_lines.append(line)
+            continue
+
+        heading = re.match(r"^#{1,6}\s+(.+)$", line)
+        if heading:
+            output.append(f"<b>{_inline_markdown_to_html(heading.group(1))}</b>")
+            continue
+        bullet = re.match(r"^\s*[-*+]\s+(.+)$", line)
+        if bullet:
+            output.append(f"• {_inline_markdown_to_html(bullet.group(1))}")
+            continue
+        quote = re.match(r"^\s*>\s?(.*)$", line)
+        if quote:
+            output.append(
+                f"<blockquote>{_inline_markdown_to_html(quote.group(1))}</blockquote>"
+            )
+            continue
+        output.append(_inline_markdown_to_html(line))
+
+    if code_lines is not None:
+        output.append(f"<pre><code>{escape(chr(10).join(code_lines))}</code></pre>")
+    return "\n".join(output)
 
 
 def _format_tool_trace(tool_calls: list[tuple[str, str, str]], secret: str = "") -> str:
@@ -140,6 +211,9 @@ def _telegram_post(base: str, method: str, data: dict,
         payload = response.json()
         if not payload.get("ok"):
             raise RuntimeError(payload.get("description", "Telegram API error"))
+        if logger:
+            message_id = payload.get("result", {}).get("message_id", "-")
+            logger.info(f"Telegram {method} ok | message_id={message_id}")
         return payload
     except Exception as error:
         err = f"Telegram {method}: {error}"
@@ -277,7 +351,9 @@ def run(agent: Agent, token: str, allowed_user_id: str, logger: SessionLogger | 
                             logger,
                         )
 
-                reply = agent.run_turn(text, on_tool_call=on_tool_call)
+                reply = _markdown_to_telegram_html(
+                    agent.run_turn(text, on_tool_call=on_tool_call)
+                )
                 reply += _model_badge(agent)
                 if agent.last_search_query:
                     url = f"https://duckduckgo.com/?q={quote_plus(agent.last_search_query)}"
