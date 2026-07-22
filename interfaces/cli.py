@@ -7,7 +7,7 @@ def run(agent: Agent) -> None:
     while True:
         try:
             user_input = input("Вы: ").strip()
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, EOFError):
             print("\nВыход.")
             break
 

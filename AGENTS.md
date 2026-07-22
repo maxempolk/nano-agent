@@ -62,6 +62,11 @@ llm-agent/
   5. track `confirmed`, `missing`, or `rejected` with a reason;
   6. allow at most one bounded replacement;
   7. synthesize only verified evidence.
+- In hybrid deep search, AFM is a candidate extractor only. Its compact output is limited to
+  claim, supporting excerpt, and explicit date; it never confirms aspects or conflicts.
+- PCC performs one batched verification of all AFM candidates, aspect coverage, comparison
+  metadata, and conflicts before synthesis. Unverified or malformed AFM output is never
+  promoted directly into the final evidence set.
 - Aspects such as income, safety, camera, API compatibility, or legal exceptions are examples only and must never be fixed fields.
 - Extraction must return claims with supporting page excerpts and dates. A claim without supporting evidence is not verified.
 - Reject pseudo-facts that only state that information is absent or the page is irrelevant.

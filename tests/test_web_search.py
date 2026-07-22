@@ -5,11 +5,14 @@ from unittest.mock import MagicMock, patch
 
 from core.tools.web_search import (
     AspectStatus,
+    AspectReview,
+    CandidateExtraction,
     ConflictAssessment,
     DeepFact,
     DeepSynthesis,
     ExpectedValue,
     MAX_FORMATTED_RESULT_CHARS,
+    MAX_RETRIES,
     LLM_INPUT_TOKEN_BUDGET,
     NormalFact,
     NormalPageEvidence,
@@ -24,6 +27,7 @@ from core.tools.web_search import (
     ResearchPlan,
     ResearchAspect,
     WebSearchTool,
+    _afm_generation_schema,
     _estimate_input_tokens,
     _flat_json_schema,
     _json_object,
@@ -77,6 +81,17 @@ class WebSearchStructuredTests(TestCase):
         self.assertNotIn("$ref", encoded)
         self.assertIn("claim", encoded)
 
+    def test_afm_schema_uses_generation_schema_dialect(self):
+        schema = _afm_generation_schema(NormalPageEvidence)
+
+        self.assertFalse(schema["additionalProperties"])
+        self.assertEqual(schema["x-order"], list(schema["properties"]))
+        fact = schema["properties"]["facts"]["items"]
+        self.assertFalse(fact["additionalProperties"])
+        self.assertEqual(fact["x-order"], list(fact["properties"]))
+        self.assertNotIn("title", fact["properties"]["claim"])
+        self.assertNotIn("default", fact["properties"]["published_at"])
+
     def test_retries_invalid_structured_output(self):
         valid = '{"facts":[],"insufficient_information":true}'
         with patch(
@@ -90,7 +105,42 @@ class WebSearchStructuredTests(TestCase):
         retry_prompt = mocked.call_args_list[1].args[2][0]["content"]
         self.assertIn("previous response was invalid", retry_prompt)
 
-    def test_empty_structured_response_is_not_retried(self):
+    def test_structured_output_uses_native_schema_not_prompt_instructions(self):
+        valid = '{"facts":[],"insufficient_information":true}'
+        with patch(
+            "core.tools.web_search.call_llm",
+            return_value=_completion(valid),
+        ) as mocked:
+            self.tool._structured("extract supported facts", NormalPageEvidence)
+
+        prompt = mocked.call_args.args[2][0]["content"]
+        response_format = mocked.call_args.kwargs["response_format"]
+        self.assertNotIn("JSON", prompt.upper())
+        self.assertNotIn("schema", prompt.lower())
+        self.assertEqual(response_format["type"], "json_schema")
+        self.assertEqual(
+            response_format["json_schema"]["name"],
+            "normal_page_evidence",
+        )
+        self.assertTrue(response_format["json_schema"]["strict"])
+        self.assertIn(
+            "facts",
+            response_format["json_schema"]["schema"]["properties"],
+        )
+
+    def test_structured_retry_does_not_request_json_in_prompt(self):
+        valid = '{"facts":[],"insufficient_information":true}'
+        with patch(
+            "core.tools.web_search.call_llm",
+            side_effect=[_completion("invalid"), _completion(valid)],
+        ) as mocked:
+            self.tool._structured("extract", NormalPageEvidence)
+
+        retry_prompt = mocked.call_args_list[1].args[2][0]["content"]
+        self.assertNotIn("JSON", retry_prompt.upper())
+        self.assertNotIn("Invalid response:", retry_prompt)
+
+    def test_empty_structured_response_exhausts_retries_then_raises(self):
         with patch(
             "core.tools.web_search.call_llm",
             return_value=_completion(""),
@@ -98,7 +148,7 @@ class WebSearchStructuredTests(TestCase):
             with self.assertRaises(ValueError):
                 self.tool._structured("extract", NormalPageEvidence)
 
-        mocked.assert_called_once()
+        self.assertEqual(mocked.call_count, MAX_RETRIES)
 
     def test_structured_prompt_is_trimmed_to_safe_local_input_budget(self):
         valid = '{"facts":[],"insufficient_information":true}'
@@ -253,7 +303,7 @@ class WebSearchStructuredTests(TestCase):
         self.assertEqual(self.tool.last_stats["mode"], "normal")
         self.assertTrue(self.tool.last_stats["escalated"])
         self.assertIn(
-            "expected_value_missing",
+            "no_relevant_results",
             self.tool.last_stats["quick_quality_reasons"],
         )
 
@@ -491,7 +541,7 @@ class WebSearchStructuredTests(TestCase):
         self.assertEqual(llm.call_args_list[0].args[1], "pcc")
         self.assertEqual(llm.call_args_list[1].args[1], "system")
 
-    def test_empty_deep_synthesis_falls_back_to_extracted_facts(self):
+    def test_empty_pcc_verification_does_not_promote_afm_candidates(self):
         pages = [NormalPageEvidence(
             facts=[NormalFact(claim="Supported fact", evidence="source text")],
             insufficient_information=False,
@@ -500,8 +550,78 @@ class WebSearchStructuredTests(TestCase):
         with patch.object(self.tool, "_structured", return_value=DeepSynthesis()):
             synthesis = self.tool._synthesize_deep("question", pages)
 
-        self.assertEqual(synthesis.facts[0].claim, "Supported fact")
-        self.assertEqual(synthesis.facts[0].source_ids, [1])
+        self.assertEqual(synthesis.facts, [])
+        self.assertTrue(synthesis.insufficient_information)
+
+    def test_afm_candidate_schema_is_intentionally_minimal(self):
+        schema = _flat_json_schema(CandidateExtraction)
+        encoded = str(schema)
+
+        self.assertIn("claim", encoded)
+        self.assertIn("evidence", encoded)
+        self.assertIn("published_at", encoded)
+        self.assertNotIn("relevance_score", encoded)
+        self.assertNotIn("acceptance_criteria", encoded)
+
+    def test_page_extraction_produces_unverified_candidates_only(self):
+        candidates = CandidateExtraction(facts=[{
+            "claim": "The measured value was 10",
+            "evidence": "The measured value was 10",
+            "published_at": "2026",
+        }])
+        result = {
+            "title": "Measurement",
+            "href": "https://example.test/value",
+            "body": "",
+        }
+        with patch.object(
+            self.tool, "_structured", return_value=candidates
+        ) as structured:
+            page = self.tool._extract_normal_page(
+                "What was the measured value?",
+                result,
+                "The measured value was 10 in 2026.",
+            )
+
+        self.assertIs(structured.call_args.args[1], CandidateExtraction)
+        self.assertEqual(page.facts[0].claim, "The measured value was 10")
+        self.assertFalse(page.answers_aspect)
+        self.assertEqual(page.rejection_reason, "pending PCC verification")
+
+    def test_pcc_review_is_required_before_aspect_confirmation(self):
+        aspect = ResearchAspect(
+            name="income",
+            query="income",
+            requirement="median household income",
+        )
+        pages = [NormalPageEvidence(
+            facts=[NormalFact(
+                claim="Median income was 10",
+                evidence="Median income was 10",
+            )],
+            insufficient_information=False,
+            aspect_name="income",
+        )]
+        unreviewed = DeepSynthesis(facts=[DeepFact(
+            claim="Median income was 10",
+            source_ids=[1],
+        )])
+        reviewed = unreviewed.model_copy(update={
+            "aspect_reviews": [AspectReview(
+                name="income",
+                status="confirmed",
+                source_ids=[1],
+            )]
+        })
+
+        self.assertEqual(
+            self.tool._reviewed_aspect_outcomes([aspect], pages, unreviewed)[0].status,
+            AspectStatus.REJECTED,
+        )
+        self.assertEqual(
+            self.tool._reviewed_aspect_outcomes([aspect], pages, reviewed)[0].status,
+            AspectStatus.CONFIRMED,
+        )
 
     def test_broad_intent_rejects_tangential_and_stale_facts(self):
         intent = SearchIntent(
@@ -579,7 +699,7 @@ class WebSearchStructuredTests(TestCase):
 
     def test_pdf_scraper_uses_pdftotext_path_before_html_extractors(self):
         with patch.object(self.tool, "_scrape_pdf", return_value="x" * 300) as pdf, \
-             patch.object(self.tool, "_scrape_trafilatura") as html:
+             patch.object(self.tool, "_scrape_crawl4ai") as html:
             content = self.tool._scrape("https://example.test/report.pdf")
 
         self.assertEqual(content, "x" * 300)
@@ -1102,3 +1222,115 @@ class WebSearchStructuredTests(TestCase):
 
         self.assertTrue(self.tool._valid_conflict(valid, 2))
         self.assertFalse(self.tool._valid_conflict(missing_definition, 2))
+
+    def test_authoritative_fresh_source_sufficient_without_value_pattern(self):
+        results = [{
+            "title": "Python Releases for Windows",
+            "href": "https://www.python.org/downloads/windows/",
+            "body": "Latest Python 3 Release - Python 3.14.6 - June 10, 2026",
+        }]
+        intent = SearchIntent(
+            original_query="Какая последняя версия Python?",
+            normalized_query="Какая последняя версия Python?",
+            expected_value=ExpectedValue.VERSION,
+            requires_freshness=True,
+            official_requested=False,
+            official_domain="python.org",
+            preferred_domains=("python.org",),
+        )
+
+        quality = self.tool._assess_quick_quality(intent, results)
+
+        self.assertTrue(quality.sufficient)
+        self.assertTrue(quality.authoritative_present)
+        self.assertTrue(quality.fresh_present)
+
+    def test_empty_structured_response_retries_through_general_path(self):
+        valid = '{"facts":[],"insufficient_information":true}'
+        with patch(
+            "core.tools.web_search.call_llm",
+            side_effect=[_completion(""), _completion(valid)],
+        ) as mocked:
+            result = self.tool._structured("extract", NormalPageEvidence)
+
+        self.assertEqual(result.facts, [])
+        self.assertEqual(mocked.call_count, 2)
+
+    def test_extraction_uses_max_retries(self):
+        candidates = CandidateExtraction(facts=[{
+            "claim": "fact",
+            "evidence": "evidence",
+            "published_at": "",
+        }])
+        result = {
+            "title": "Test",
+            "href": "https://example.test/page",
+            "body": "",
+        }
+        with patch.object(
+            self.tool, "_structured", return_value=candidates
+        ) as structured:
+            self.tool._extract_normal_page("question", result, "page text")
+
+        self.assertEqual(structured.call_args.kwargs.get("max_attempts"), MAX_RETRIES)
+
+    def test_planner_normalization_uses_research_aspects_when_queries_empty(self):
+        raw = (
+            '{"queries":[],"search_queries":[],"subject":"Norway and Sweden",'
+            '"aspects":["cost of living","incomes","housing","safety"],'
+            '"expected_value":"fact","requires_freshness":true,'
+            '"official_domain":"","official_domains":[],'
+            '"research_aspects":['
+            '{"name":"cost of living","query":"Norway Sweden cost of living comparison"},'
+            '{"name":"incomes","query":"Norway Sweden average income statistics"},'
+            '{"name":"housing","query":"Norway Sweden housing prices comparison"},'
+            '{"name":"safety","query":"Norway Sweden crime safety statistics"}]}'
+        )
+        self.tool._budget = SearchBudget.for_mode(SearchMode.DEEP)
+
+        with patch("core.tools.web_search.call_llm", return_value=_completion(raw)):
+            plan, intent = self.tool._plan_research(
+                "исследуй стоимость жизни в Норвегии и Швеции",
+                SearchMode.DEEP,
+            )
+
+        self.assertEqual(len(plan.search_queries), 4)
+        self.assertIn("cost of living", plan.search_queries[0])
+        self.assertIn("safety", plan.search_queries[3])
+
+    def test_replacement_skips_duplicate_urls(self):
+        broken = {
+            "title": "Broken page",
+            "href": "https://broken.test/page",
+            "body": "content",
+            "_plan_query": 0,
+        }
+        duplicate_a = {
+            "title": "Duplicate A",
+            "href": "https://same.test/page",
+            "body": "content",
+            "_plan_query": 0,
+        }
+        duplicate_b = {
+            "title": "Duplicate B",
+            "href": "https://same.test/page",
+            "body": "content",
+            "_plan_query": 1,
+        }
+        selected = [broken]
+        scraped = {broken["href"]: "Не удалось извлечь текст."}
+        self.tool.last_intent = SearchIntent(
+            original_query="test",
+            normalized_query="test",
+            expected_value=ExpectedValue.FACT,
+            requires_freshness=False,
+            official_requested=False,
+            official_domain=None,
+        )
+
+        with patch.object(self.tool, "_scrape", return_value="") as scrape:
+            self.tool._replace_unreadable_sources(
+                selected, [broken, duplicate_a, duplicate_b], scraped
+            )
+
+        self.assertEqual(scrape.call_count, 1)

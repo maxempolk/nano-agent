@@ -148,7 +148,7 @@ class AgentForcedSearchTests(TestCase):
         self.assertEqual(len(llm.call_args.args), 3)
         self.assertTrue(
             llm.call_args.args[2][0]["content"].startswith(
-                "You write a reader-facing answer"
+                "Ты пишешь ответ для пользователя"
             )
         )
 
@@ -174,8 +174,11 @@ class AgentForcedSearchTests(TestCase):
         self.assertEqual(len(llm.call_args_list[1].args), 3)
         recovery_messages = llm.call_args_list[1].args[2]
         self.assertFalse(any(message.get("role") == "tool" for message in recovery_messages))
-        self.assertEqual([message["role"] for message in recovery_messages], ["system", "user"])
-        self.assertIn("GPT-5.4", recovery_messages[1]["content"])
+        self.assertEqual(
+            [message["role"] for message in recovery_messages],
+            ["system", "user", "assistant", "user"],
+        )
+        self.assertIn("GPT-5.4", recovery_messages[-1]["content"])
 
     def test_empty_protocol_recovery_returns_tool_evidence_instead_of_silence(self):
         web = FakeWebSearch()
@@ -241,7 +244,7 @@ class AgentForcedSearchTests(TestCase):
         self.assertEqual(len(llm.call_args_list[1].args), 3)
         self.assertTrue(
             llm.call_args_list[1].args[2][0]["content"].startswith(
-                "You write a reader-facing answer"
+                "Ты пишешь ответ для пользователя"
             )
         )
 

@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 logs/
 jobs.json
+benchmark-results/

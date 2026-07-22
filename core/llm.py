@@ -142,10 +142,13 @@ def _normalize_completion(response, model: str) -> ChatCompletion:
 
 
 def call_llm(client: OpenAI, model: str, messages: list,
-             tools: list | None = None) -> ChatCompletion:
+             tools: list | None = None,
+             response_format: dict | None = None) -> ChatCompletion:
     kwargs: dict = {"model": model, "messages": messages}
     if tools:
         kwargs["tools"] = tools
         kwargs["tool_choice"] = "auto"
+    if response_format:
+        kwargs["response_format"] = response_format
     response = client.chat.completions.create(**kwargs)
     return _normalize_completion(response, model)

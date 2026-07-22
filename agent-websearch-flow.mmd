@@ -1,0 +1,80 @@
+flowchart TD
+    USER["👤 User: 'загугли какая щас версия пайтона'"]
+
+    USER --> FORCED{"1. Forced Search Check<br/>(regex в agent.py)"}
+
+    FORCED -->|"CHANGING_WEB_FACT:<br/>сейчас|последн|курс|погода|версия"| WS_FORCED["forced web_search(query, depth)<br/>turn_tools = []"]
+    FORCED -->|"EXPLICIT_WEB_SEARCH:<br/>загугли|поищи|найди|search"| WS_FORCED
+    FORCED -->|"Не совпало"| LLM_DECIDE["2. LLM решает<br/>call_llm с tools=[web_search]"]
+
+    LLM_DECIDE -->|"Модель вызвала web_search"| WS_LLM["web_search(query, depth)"]
+    LLM_DECIDE -->|"Модель НЕ вызвала поиск"| HALLUC["⚠️ Галлюцинация<br/>или пустой ответ<br/>(2/10 запросов)"]
+
+    WS_FORCED --> MODE
+    WS_LLM --> MODE
+
+    MODE{"3. _select_mode<br/>(web_search.py)"}
+    MODE -->|"DEEP_QUERY regex<br/>подробно|исследуй|сравни"| DEEP
+    MODE -->|"NORMAL_QUERY regex<br/>или длинный запрос"| NORMAL
+    MODE -->|"остальное"| QUICK
+
+    subgraph QUICK_PATH ["QUICK PATH"]
+        QUICK["Quick Search"] --> DDG_Q["DuckDuckGo<br/>10 результатов"]
+        DDG_Q --> QUALITY{"_assess_quick_quality<br/>score = relevant×10<br/>+ value +30<br/>+ fresh +20<br/>+ authoritative +20"}
+        QUALITY -->|"sufficient<br/>score ≥ 40/50"| FMT_QUICK["_format_quick_results<br/>'Quick web results:<br/>[1] title / snippet'"]
+        QUALITY -->|"not sufficient<br/>(depth=auto)"| ESCALATE["Эскалация → normal"]
+    end
+
+    ESCALATE --> NORMAL
+
+    subgraph NORMAL_PATH ["NORMAL PATH"]
+        NORMAL["Normal Search"] --> PLAN["_plan_research<br/>LLM (PCC) → план запросов<br/>⚠️ timeout 53с"]
+        PLAN --> DDG_N["DuckDuckGo × N запросов"]
+        DDG_N --> SCRAPE_N["_scrape(url)<br/>crawl4ai × ≤2 страниц"]
+        SCRAPE_N --> EXTRACT["_extract_normal_page<br/>LLM → факты<br/>⚠️ часто facts:[]"]
+        EXTRACT --> FMT_NORMAL["_format_normal_results<br/>'Web evidence: [1]...'"]
+    end
+
+    subgraph DEEP_PATH ["DEEP PATH"]
+        DEEP["Deep Search"] --> PLAN_D["_plan_research<br/>LLM → аспекты + запросы"]
+        PLAN_D --> DDG_D["DuckDuckGo × N запросов"]
+        DDG_D --> SELECT["_select_deep_sources<br/>≤5 источников"]
+        SELECT --> SCRAPE_D["_scrape × 5<br/>crawl4ai"]
+        SCRAPE_D --> EXTRACT_D["_extract_deep_page<br/>LLM → факты по аспектам"]
+        EXTRACT_D --> SYNTH["_synthesize<br/>LLM → верификация"]
+        SYNTH --> FMT_DEEP["_format_deep_results<br/>'Deep web evidence:...'"]
+    end
+
+    FMT_QUICK --> EVIDENCE
+    FMT_NORMAL --> EVIDENCE
+    FMT_DEEP --> EVIDENCE
+
+    EVIDENCE["📄 Evidence Text<br/>(сниппеты / факты / синтез)"]
+
+    EVIDENCE --> FINALIZER
+
+    subgraph FINALIZER_BLOCK ["4. FINALIZER (agent.py)"]
+        FINALIZER{"_finalize_research<br/>Промпт: 'Lead with direct answer'"}
+        FINALIZER --> AFM["Попытка 1: AFM (system)<br/>local model"]
+        AFM --> VALID{"_valid_finalizer_text"}
+        VALID -->|"пусто / JSON / fence"| REJECT["❌ reject"]
+        VALID -->|"language_mismatch<br/>⚠️ 28% случаев"| REJECT
+        VALID -->|"OK"| ANSWER_OK["✅ Ответ пользователю"]
+        REJECT --> PCC["Попытка 2: PCC<br/>(fallback model)"]
+        PCC --> VALID2{"_valid_finalizer_text"}
+        VALID2 -->|"OK"| ANSWER_OK
+        VALID2 -->|"fail"| FALLBACK["deterministic_fallback<br/>⚠️ сырой дамп сниппетов"]
+    end
+
+    ANSWER_OK --> USER_OUT["👤 User получает ответ"]
+    FALLBACK --> USER_OUT
+    HALLUC --> USER_OUT
+
+    style HALLUC fill:#ff6b6b,color:#fff
+    style FALLBACK fill:#ff6b6b,color:#fff
+    style REJECT fill:#ffa94d,color:#fff
+    style ANSWER_OK fill:#51cf66,color:#fff
+    style USER_OUT fill:#339af0,color:#fff
+    style ESCALATE fill:#ffa94d,color:#fff
+    style PLAN fill:#ffa94d,color:#fff
+    style EXTRACT fill:#ffa94d,color:#fff

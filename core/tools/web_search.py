@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -15,17 +16,11 @@ import time
 from typing import TYPE_CHECKING, TypeVar
 from urllib.parse import urlparse
 
+from crawl4ai import AsyncWebCrawler, BrowserConfig, CrawlerRunConfig, CacheMode
 from ddgs import DDGS
 import httpx
 from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError
-import trafilatura
-
-try:
-    from newspaper import Article as NewspaperArticle
-    _NEWSPAPER_OK = True
-except ImportError:
-    _NEWSPAPER_OK = False
 
 from core.llm import call_llm
 
@@ -51,7 +46,7 @@ MESSAGE_TOKEN_OVERHEAD = 128
 
 MODE_LIMITS = {
     "quick": (0, 15.0),
-    "normal": (3, 45.0),
+    "normal": (5, 45.0),
     "deep": (8, 100.0),
 }
 
@@ -175,9 +170,20 @@ class NormalFact(BaseModel):
     definition: str = ""
 
 
+class CandidateFact(BaseModel):
+    claim: str
+    evidence: str
+    published_at: str = ""
+
+
+class CandidateExtraction(BaseModel):
+    facts: list[CandidateFact] = Field(default_factory=list)
+
+
 class NormalPageEvidence(BaseModel):
     facts: list[NormalFact]
     insufficient_information: bool
+    aspect_name: str = ""
     answers_aspect: bool = True
     relevance_score: int = Field(default=100, ge=0, le=100)
     rejection_reason: str = ""
@@ -204,10 +210,18 @@ class ConflictAssessment(BaseModel):
     definition: str = ""
 
 
+class AspectReview(BaseModel):
+    name: str
+    status: str
+    source_ids: list[int] = Field(default_factory=list)
+    reason: str = ""
+
+
 class DeepSynthesis(BaseModel):
     facts: list[DeepFact] = Field(default_factory=list)
     conflicts: list[str] = Field(default_factory=list)
     conflict_details: list[ConflictAssessment] = Field(default_factory=list)
+    aspect_reviews: list[AspectReview] = Field(default_factory=list)
     insufficient_information: bool = False
 
 
@@ -378,6 +392,13 @@ class PlannedQuery(BaseModel):
     acceptance_criteria: str = ""
 
 
+class NormalPlan(BaseModel):
+    queries: list[str] = Field(default_factory=list)
+    subject: str = ""
+    expected_value: ExpectedValue = ExpectedValue.FACT
+    official_domain: str = ""
+
+
 class ResearchPlan(BaseModel):
     queries: list[PlannedQuery] = Field(default_factory=list)
     search_queries: list[str] = Field(default_factory=list)
@@ -540,11 +561,39 @@ def _flat_json_schema(model: type[BaseModel]) -> dict:
     return inline(schema)
 
 
+def _afm_generation_schema(model: type[BaseModel]) -> dict:
+    """Convert Pydantic's schema into the dialect accepted by ``fm serve``."""
+    schema = _flat_json_schema(model)
+
+    def convert(node: object, *, root: bool = False) -> object:
+        if isinstance(node, list):
+            return [convert(item) for item in node]
+        if not isinstance(node, dict):
+            return node
+
+        converted = {
+            key: convert(value)
+            for key, value in node.items()
+            if key not in {"default"}
+            and not (key == "title" and not root and node.get("type") != "object")
+        }
+        if converted.get("type") == "object":
+            properties = converted.get("properties", {})
+            if isinstance(properties, dict):
+                converted["additionalProperties"] = False
+                converted["x-order"] = list(properties)
+        return converted
+
+    return convert(schema, root=True)  # type: ignore[return-value]
+
+
 class WebSearchTool:
     SCHEMA = SCHEMA
 
     def __init__(self, client: OpenAI, model: str, model_mini: str | None = None,
-                 planner_model: str | None = None, logger: SessionLogger | None = None,
+                 planner_model: str | None = None,
+                 deep_planner_model: str | None = None,
+                 logger: SessionLogger | None = None,
                  force_depth: str | None = None):
         if force_depth not in {None, "quick", "normal", "deep"}:
             raise ValueError("force_depth должен быть quick, normal, deep или None")
@@ -552,6 +601,7 @@ class WebSearchTool:
         self.model = model
         self.model_mini = model_mini or model
         self.planner_model = planner_model or model
+        self.deep_planner_model = deep_planner_model or self.planner_model
         self.logger = logger
         self.force_depth = force_depth
         self.last_query = ""
@@ -560,6 +610,10 @@ class WebSearchTool:
         self.last_plan: ResearchPlan | None = None
         self.last_result: ResearchResult | None = None
         self._budget: SearchBudget | None = None
+        self._aggregate = {
+            "total": 0, "quick": 0, "escalated": 0,
+            "normal": 0, "deep": 0, "quick_score_sum": 0,
+        }
 
     def _store_result(self, query: str, mode: SearchMode, results: list[dict],
                       synthesis: DeepSynthesis,
@@ -603,7 +657,8 @@ class WebSearchTool:
         if self.logger:
             self.logger.info(f"web_search | {message}")
 
-    def _call_model(self, messages: list, stage: str, model: str | None = None):
+    def _call_model(self, messages: list, stage: str, model: str | None = None,
+                    response_format: dict | None = None):
         call_number = None
         input_estimate = _estimate_input_tokens(messages)
         if input_estimate > LLM_INPUT_TOKEN_BUDGET:
@@ -615,7 +670,12 @@ class WebSearchTool:
             call_number = self._budget.consume_llm()
         started = time.monotonic()
         try:
-            return call_llm(self.client, model or self.model_mini, messages)
+            return call_llm(
+                self.client,
+                model or self.model_mini,
+                messages,
+                response_format=response_format,
+            )
         except Exception as error:
             message = str(error).lower()
             if "context size" in message or "maximum allowed context" in message:
@@ -645,8 +705,16 @@ class WebSearchTool:
     def _structured(self, prompt: str, output_type: type[StructuredModel],
                     max_attempts: int = MAX_RETRIES, *, model: str | None = None,
                     stage: str = "structured") -> StructuredModel:
-        schema = json.dumps(_flat_json_schema(output_type), ensure_ascii=False, separators=(",", ":"))
-        suffix = f"\n\nReturn ONLY one valid JSON object matching this JSON Schema:\n{schema}"
+        response_format = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": re.sub(
+                    r"(?<!^)(?=[A-Z])", "_", output_type.__name__
+                ).lower(),
+                "strict": True,
+                "schema": _afm_generation_schema(output_type),
+            },
+        }
         max_payload_chars = int(
             (LLM_INPUT_TOKEN_BUDGET - MESSAGE_TOKEN_OVERHEAD - 250)
             * CONSERVATIVE_CHARS_PER_TOKEN
@@ -658,7 +726,7 @@ class WebSearchTool:
         for attempt in range(max_attempts):
             prompt_limit = max(
                 500,
-                max_payload_chars - len(suffix) - len(retry_note) - 100,
+                max_payload_chars - len(retry_note) - 100,
             )
             fitted_prompt = _clip_middle(prompt, prompt_limit)
             if fitted_prompt != prompt:
@@ -667,14 +735,12 @@ class WebSearchTool:
                     f"original_chars={len(prompt)} | fitted_chars={len(fitted_prompt)}"
                 )
             response = self._call_model(
-                [{"role": "user", "content": fitted_prompt + suffix + retry_note}],
+                [{"role": "user", "content": fitted_prompt + retry_note}],
                 stage,
                 model=model,
+                response_format=response_format,
             )
             raw = response.choices[0].message.content or ""
-            if not raw.strip():
-                self._log("stage=structured_empty | retry=false")
-                raise StructuredOutputError(raw, ValueError("empty model response"))
             try:
                 return output_type.model_validate(_json_object(raw))
             except (ValueError, json.JSONDecodeError, ValidationError) as error:
@@ -685,30 +751,75 @@ class WebSearchTool:
                 )
                 if attempt + 1 < max_attempts:
                     retry_note = (
-                        "\n\nYour previous response was invalid. Correct the JSON and return the "
-                        f"object only. Validation error: {_clip(str(error), 500)}\n"
-                        f"Invalid response: {_clip(raw, 1200)}"
+                        "\n\nPrevious response was invalid JSON. "
+                        f"Error: {_clip(str(error), 200)}. "
+                        "Return valid JSON with all required fields."
                     )
 
         raise StructuredOutputError(raw, last_error)
 
-    def _scrape_trafilatura(self, url: str) -> str:
+    async def _scrape_crawl4ai_async(self, url: str) -> str:
         try:
-            downloaded = trafilatura.fetch_url(url)
-            return trafilatura.extract(downloaded) or ""
+            browser_config = BrowserConfig(headless=True, verbose=False)
+            run_config = CrawlerRunConfig(
+                cache_mode=CacheMode.BYPASS,
+                page_timeout=30000,
+            )
+            async with AsyncWebCrawler(config=browser_config) as crawler:
+                result = await crawler.arun(url=url, config=run_config)
+                if result.success and result.markdown:
+                    return result.markdown.fit_markdown or result.markdown or ""
+                return ""
         except Exception:
             return ""
 
-    def _scrape_newspaper(self, url: str) -> str:
-        if not _NEWSPAPER_OK:
-            return ""
+    def _scrape_crawl4ai(self, url: str) -> str:
         try:
-            article = NewspaperArticle(url)
-            article.download()
-            article.parse()
-            return article.text or ""
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(self._scrape_crawl4ai_async(url))
+            finally:
+                loop.close()
         except Exception:
             return ""
+
+    async def _scrape_batch_async(self, urls: list[str]) -> dict[str, str]:
+        results: dict[str, str] = {}
+        try:
+            browser_config = BrowserConfig(headless=True, verbose=False)
+            run_config = CrawlerRunConfig(
+                cache_mode=CacheMode.BYPASS,
+                page_timeout=30000,
+            )
+            async with AsyncWebCrawler(config=browser_config) as crawler:
+                for url in urls:
+                    try:
+                        result = await crawler.arun(url=url, config=run_config)
+                        if result.success and result.markdown:
+                            results[url] = (
+                                result.markdown.fit_markdown
+                                or result.markdown or ""
+                            )
+                        else:
+                            results[url] = ""
+                    except Exception:
+                        results[url] = ""
+        except Exception:
+            for url in urls:
+                results.setdefault(url, "")
+        return results
+
+    def _scrape_batch(self, urls: list[str]) -> dict[str, str]:
+        if not urls:
+            return {}
+        try:
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(self._scrape_batch_async(urls))
+            finally:
+                loop.close()
+        except Exception:
+            return {url: "" for url in urls}
 
     def _scrape_pdf(self, url: str) -> str:
         if not shutil.which("pdftotext"):
@@ -738,22 +849,34 @@ class WebSearchTool:
     def _scrape(self, url: str) -> str:
         text = self._scrape_pdf(url) if urlparse(url).path.lower().endswith(".pdf") else ""
         if len(text) < 200:
-            text = self._scrape_trafilatura(url) or text
-        if len(text) < 200:
-            text = self._scrape_newspaper(url) or text
+            text = self._scrape_crawl4ai(url) or text
         return text or "Не удалось извлечь текст."
 
     def _search(self, query: str) -> list[dict]:
         started = time.monotonic()
-        with DDGS() as ddg:
-            results = list(ddg.text(query, max_results=MAX_RESULTS))
-        if self._budget:
-            self._budget.check_deadline()
-        self._log(
-            f"stage=search | results={len(results)} | "
-            f"elapsed={time.monotonic() - started:.2f}s"
-        )
-        return results
+        last_error: Exception | None = None
+        for attempt in range(1 + MAX_RETRIES):
+            try:
+                with DDGS() as ddg:
+                    results = list(ddg.text(query, max_results=MAX_RESULTS))
+                if self._budget:
+                    self._budget.check_deadline()
+                self._log(
+                    f"stage=search | results={len(results)} | "
+                    f"attempt={attempt + 1} | "
+                    f"elapsed={time.monotonic() - started:.2f}s"
+                )
+                return results
+            except Exception as error:
+                last_error = error
+                self._log(
+                    f"stage=search_error | attempt={attempt + 1}/{1 + MAX_RETRIES} | "
+                    f"error={_clip(str(error), 120)}"
+                )
+                if attempt < MAX_RETRIES:
+                    time.sleep(2 * (attempt + 1))
+        self._log(f"stage=search_failed | error={_clip(str(last_error), 120)}")
+        return []
 
     def _search_many(self, queries: list[str]) -> list[dict]:
         if len(queries) == 1:
@@ -860,34 +983,57 @@ class WebSearchTool:
 
     def _plan_research(self, query: str, mode: SearchMode) -> tuple[ResearchPlan, SearchIntent]:
         fallback = self._analyze_intent(query)
-        prompt = (
-            "Plan a web research task. Preserve every requested dimension as concise English "
-            "aspects and put the main entity being researched in subject. Produce 1-5 query "
-            "objects that collectively cover the aspects, rather "
-            "than one vague query. Every object must bind an English query and aspect to its "
-            "evidence contract: expected_evidence, requirement, priority 1-5, freshness, "
-            "preferred source type, and a short acceptance criterion. Mirror these contracts "
-            "in research_aspects in the same order as queries. "
-            "Use bare official_domain when a primary source exists, or an empty domain for an "
-            "independent broad search. Use expected_value=fact for broad questions; "
-            "use number, price, weather, version, or date only when the whole question asks "
-            "for that single value type. Set freshness only when current data matters. List "
-            "the bare official_domains of primary statistical, government, or vendor sources, "
-            "ordered by how many aspects each domain can cover. "
-            "At least half of the query objects should target primary sources; keep the rest "
-            "broad enough to reveal independent evidence or conflicts. "
-            "Use official_domain for compatibility only when exactly one primary domain is "
-            "relevant. Do not answer the question.\n\n"
-            f"Search depth: {mode.value}\nUser question: {query}"
-        )
-        try:
-            plan = self._structured(
-                prompt,
-                ResearchPlan,
-                max_attempts=1,
-                model=self.planner_model,
-                stage="plan",
+        if mode == SearchMode.DEEP:
+            prompt = (
+                "Plan a deep web research. Decompose the question into aspects and "
+                "generate search queries that cover them.\n\n"
+                "Structure:\n"
+                "1. Put the main entity in subject. List each dimension as a short "
+                "English aspect.\n"
+                "2. Create 1-5 query objects. Each query targets one aspect with an "
+                "evidence contract: expected_evidence, requirement, priority (1-5), "
+                "freshness flag, preferred_source_type, acceptance_criteria.\n"
+                "3. Mirror the contracts in research_aspects in the same order as "
+                "queries.\n"
+                "4. List primary-source domains in official_domains, ordered by how "
+                "many aspects each covers. At least half of queries should target "
+                "primary sources; the rest should be broad for independent evidence.\n\n"
+                "Rules:\n"
+                "- expected_value: use fact for broad questions; number, price, "
+                "weather, version, or date only when the entire question asks for "
+                "that single value type.\n"
+                "- requires_freshness: set true only when current data matters.\n"
+                "- official_domain: set only when exactly one primary domain is "
+                "relevant.\n\n"
+                f"Question: {query}"
             )
+            plan_model = self.deep_planner_model
+        else:
+            prompt = (
+                "Generate 1-2 short English search queries that will find the answer.\n"
+                "Put the main entity or topic in subject.\n"
+                "If one official site is the primary source, put its domain in "
+                "official_domain. Otherwise leave it empty.\n\n"
+                f"Question: {query}"
+            )
+            plan_model = self.planner_model
+        try:
+            if mode == SearchMode.DEEP:
+                plan = self._structured(
+                    prompt, ResearchPlan, max_attempts=1,
+                    model=plan_model, stage="plan",
+                )
+            else:
+                normal_plan = self._structured(
+                    prompt, NormalPlan, max_attempts=1,
+                    model=plan_model, stage="plan",
+                )
+                plan = ResearchPlan(
+                    search_queries=normal_plan.queries,
+                    subject=normal_plan.subject,
+                    expected_value=normal_plan.expected_value,
+                    official_domain=normal_plan.official_domain,
+                )
         except Exception as error:
             self._log(f"stage=plan_fallback | reason={_clip(str(error), 180)}")
             plan = ResearchPlan(
@@ -914,13 +1060,18 @@ class WebSearchTool:
                 r"(?:[a-z0-9-]+\.)+[a-z]{2,}", value
             ) else ""
 
-        raw_queries = plan.queries[:query_limit]
-        if not raw_queries:
-            raw_queries = [
-                PlannedQuery(query=item)
-                for item in plan.search_queries[:query_limit]
-                if isinstance(item, str) and item.strip()
-            ]
+        raw_queries = list(plan.queries[:query_limit])
+        for item in plan.search_queries:
+            if len(raw_queries) >= query_limit:
+                break
+            if isinstance(item, str) and item.strip():
+                raw_queries.append(PlannedQuery(query=item))
+        for aspect in plan.research_aspects:
+            if len(raw_queries) >= query_limit:
+                break
+            source = aspect.query or aspect.name
+            if source and source.strip():
+                raw_queries.append(PlannedQuery(query=source, aspect=aspect.name))
         if not raw_queries:
             raw_queries = [PlannedQuery(
                 query=fallback.search_query(),
@@ -1014,8 +1165,9 @@ class WebSearchTool:
             subject=_clip(plan.subject, 100),
         )
         self._log(
-            f"stage=plan | model={self.planner_model} | aspects={len(aspects)} | "
-            f"queries={len(queries)} | expected={plan.expected_value.value} | "
+            f"stage=plan | model={plan_model} | mode={mode.value} | "
+            f"aspects={len(aspects)} | queries={len(queries)} | "
+            f"expected={plan.expected_value.value} | "
             f"fresh={str(plan.requires_freshness).lower()} | "
             f"official={','.join(domains) or '-'}"
         )
@@ -1202,6 +1354,8 @@ class WebSearchTool:
             "сколько", "количество", "сейчас", "актуальная", "официальная",
             "какая", "какой", "последняя", "последний", "последнюю", "версия",
             "проверь", "источникам", "источники",
+            "загугли", "загугл", "поищи", "поиск", "найди", "найти", "ищи",
+            "search", "google", "browse", "look", "check", "find",
         }
         return {
             word[:6]
@@ -1307,7 +1461,12 @@ class WebSearchTool:
 
         for result in ranked[:QUICK_RESULTS]:
             overlap = len(query_terms & self._result_terms(result))
-            required_overlap = 1 if len(query_terms) <= 2 else 2
+            if len(query_terms) <= 1:
+                required_overlap = 0
+            elif len(query_terms) <= 3:
+                required_overlap = 1
+            else:
+                required_overlap = 2
             if overlap >= required_overlap:
                 relevant += 1
             text = f"{result.get('title', '')} {result.get('body', '')}"
@@ -1327,18 +1486,15 @@ class WebSearchTool:
         if authoritative_present:
             score += 20
 
-        needs_value = intent.expected_value != ExpectedValue.FACT
-        sufficient = relevant >= 1 and (value_present or not needs_value)
+        sufficient = relevant >= 1
         if intent.requires_freshness:
-            sufficient = sufficient and (fresh_present or authoritative_present) and score >= 60
+            sufficient = sufficient and (fresh_present or authoritative_present) and score >= 50
         else:
             sufficient = sufficient and score >= 40
 
         reasons = []
         if relevant < 1:
             reasons.append("no_relevant_results")
-        if needs_value and not value_present:
-            reasons.append("expected_value_missing")
         if intent.requires_freshness and not (fresh_present or authoritative_present):
             reasons.append("freshness_unconfirmed")
         if not reasons and not sufficient:
@@ -1445,35 +1601,38 @@ class WebSearchTool:
         aspect_text = ""
         if aspect:
             aspect_text = (
-                f"Aspect: {aspect.name}\nEvidence kind: {aspect.expected_evidence.value}\n"
-                f"Requirement: {aspect.requirement}\nPriority: {aspect.priority}\n"
-                f"Aspect freshness required: {str(aspect.requires_freshness).lower()}\n"
-                f"Preferred source: {aspect.preferred_source_type}\n"
+                f"Aspect: {aspect.name}\nRequirement: {aspect.requirement}\n"
                 f"Acceptance criterion: {aspect.acceptance_criteria}\n\n"
             )
         prompt = (
-            "Assess this page against the supplied research aspect, then extract up to 3 facts "
-            "that directly satisfy it. Each claim must have a "
-            "short supporting excerpt from the provided page. Do not use outside knowledge. "
-            "Set published_at to the publication/update date supporting the fact, or an empty "
-            "string when absent. Set insufficient_information=true when the page cannot answer "
-            "the question. For a number question, extract only the total count of the requested "
-            "subject; reject counts of categories, people, accounts, years or related objects. "
-            "Set answers_aspect=false and explain rejection_reason when the page is merely "
-            "topically related but does not meet the acceptance criterion. Score relevance "
-            "0-100. Fill metric, unit, period, geography, and definition when applicable. "
-            f"Expected value type: {intent.expected_value.value}. "
-            f"Current information required: {str(intent.requires_freshness).lower()}.\n\n"
+            "Extract up to 3 facts from this page that answer the question.\n"
+            "For each fact return:\n"
+            "- claim: the fact in one sentence\n"
+            "- evidence: exact short quote from the page supporting it\n"
+            "- published_at: date if the page states one, else empty\n"
+            "Use only information present on this page. "
+            "Return an empty facts list if nothing relevant is found.\n\n"
             f"{aspect_text}"
-            f"Question: {question}\nTitle: {result.get('title', '')}\n"
-            f"URL: {result.get('href', '')}\n\nPage passages:\n{context}"
+            f"Question: {question}\n"
+            f"Page: {result.get('title', '')} ({result.get('href', '')})\n\n"
+            f"Page content:\n{context}"
         )
         try:
-            evidence = self._structured(prompt, NormalPageEvidence, max_attempts=1)
+            candidates = self._structured(prompt, CandidateExtraction, max_attempts=MAX_RETRIES)
+            evidence = NormalPageEvidence(
+                facts=[NormalFact(**fact.model_dump()) for fact in candidates.facts[:3]],
+                insufficient_information=not candidates.facts,
+                answers_aspect=False,
+                relevance_score=0,
+                aspect_name=aspect.name if aspect else "",
+            )
         except StructuredOutputError as error:
             evidence = self._recover_normal_evidence(error.raw)
         except SearchBudgetExceeded:
-            return NormalPageEvidence(facts=[], insufficient_information=True)
+            return NormalPageEvidence(
+                facts=[], insufficient_information=True,
+                aspect_name=aspect.name if aspect else "",
+            )
         facts = [
                 NormalFact(
                     claim=_clip(fact.claim, 300),
@@ -1488,13 +1647,14 @@ class WebSearchTool:
                 for fact in evidence.facts[:3]
                 if self._fact_matches_intent(intent, fact, result.get("href", ""))
             ]
-        answers = bool(facts) and evidence.answers_aspect and evidence.relevance_score >= 50
+        answers = bool(facts)
         return NormalPageEvidence(
-            facts=facts if answers else [],
-            insufficient_information=evidence.insufficient_information or not answers,
-            answers_aspect=answers,
-            relevance_score=evidence.relevance_score,
-            rejection_reason=_clip(evidence.rejection_reason, 180),
+            facts=facts,
+            insufficient_information=not answers,
+            answers_aspect=False,
+            relevance_score=0,
+            rejection_reason="pending PCC verification" if answers else "no candidates",
+            aspect_name=aspect.name if aspect else "",
         )
 
     def _fact_matches_intent(self, intent: SearchIntent, fact: NormalFact,
@@ -1646,10 +1806,18 @@ class WebSearchTool:
         started = time.monotonic()
         urls = [result["href"] for result in results]
         scraped: dict[str, str] = {}
-        with ThreadPoolExecutor(max_workers=len(urls)) as executor:
-            futures = {executor.submit(self._scrape, url): url for url in urls}
-            for future in as_completed(futures):
-                scraped[futures[future]] = future.result()
+        crawl_urls: list[str] = []
+        for url in urls:
+            if urlparse(url).path.lower().endswith(".pdf"):
+                text = self._scrape_pdf(url)
+                if len(text) >= 200:
+                    scraped[url] = text
+                    continue
+            crawl_urls.append(url)
+        if crawl_urls:
+            scraped.update(self._scrape_batch(crawl_urls))
+        for url in urls:
+            scraped.setdefault(url, "")
         if self._budget:
             self._budget.check_deadline()
         self._log(
@@ -1673,6 +1841,7 @@ class WebSearchTool:
             )
             if result.get("href") not in selected_urls
         ]
+        tried_urls: set[str] = set()
         for index, source in enumerate(list(selected)):
             source_url = source.get("href", "")
             if self._usable_page(scraped.get(source_url, "")):
@@ -1688,8 +1857,12 @@ class WebSearchTool:
             for candidate in ordered:
                 if attempts >= MAX_SOURCE_REPLACEMENT_ATTEMPTS:
                     break
+                candidate_url = candidate["href"]
+                if candidate_url in tried_urls:
+                    continue
+                tried_urls.add(candidate_url)
                 attempts += 1
-                candidate_text = self._scrape(candidate["href"])
+                candidate_text = self._scrape(candidate_url)
                 candidates.remove(candidate)
                 if self._usable_page(candidate_text):
                     replacement = candidate
@@ -1786,9 +1959,21 @@ class WebSearchTool:
             )
         )
         scraped = self._fetch_pages(selected)
+        pages: list[NormalPageEvidence | None] = [None] * len(selected)
+        with ThreadPoolExecutor(max_workers=len(selected)) as executor:
+            futures = {
+                executor.submit(
+                    self._extract_normal_page, query, result,
+                    scraped[result["href"]],
+                ): index
+                for index, result in enumerate(selected)
+            }
+            for future in as_completed(futures):
+                pages[futures[future]] = future.result()
         pages = [
-            self._extract_normal_page(query, result, scraped[result["href"]])
-            for result in selected
+            page if page is not None
+            else NormalPageEvidence(facts=[], insufficient_information=True)
+            for page in pages
         ]
         synthesis = DeepSynthesis(
             facts=[
@@ -1830,37 +2015,57 @@ class WebSearchTool:
 
     def _synthesize_deep(self, question: str,
                          pages: list[NormalPageEvidence]) -> DeepSynthesis:
+        aspects = list(self.last_plan.research_aspects if self.last_plan else [])
+        aspect_contracts = [aspect.model_dump(mode="json") for aspect in aspects]
         material = json.dumps([
             {
                 "source_id": source_id,
+                "bound_aspect": page.aspect_name,
                 "facts": [fact.model_dump() for fact in page.facts],
             }
             for source_id, page in enumerate(pages, start=1)
         ], ensure_ascii=False)
         prompt = (
-            f"Verify and combine evidence for this research question: {question}\n"
-            f"Return at most {MAX_DEEP_FACTS} concise facts. Merge duplicates, preserve every "
-            "supporting source_id and keep dates. A conflict is valid only when metric, unit, "
-            "period, geography, and definition are compatible; different dates or definitions "
-            "alone are not conflicts. Put validated disagreements in conflict_details. Do not "
-            "add outside knowledge. Source IDs are 1-based.\n\n"
-            f"Evidence: {material}"
+            f"Verify candidate facts for the research question: {question}\n\n"
+            "The candidates below come from a smaller extraction model and are "
+            "untrusted. Use only information present in the candidates.\n\n"
+            "Verification rules:\n"
+            "1. Reject vague, tangential, unsupported, outdated, or ambiguous facts.\n"
+            "2. A page can only confirm its bound_aspect.\n"
+            "3. Return one aspect_review per contract: confirmed (needs at least "
+            "one accepted fact with valid source_id), rejected, or missing.\n"
+            f"4. Return at most {MAX_DEEP_FACTS} accepted facts. Merge duplicates, "
+            "keep all supporting source_ids and dates.\n"
+            "5. A conflict is valid only when metric, unit, period, geography, and "
+            "definition are compatible. Different dates or definitions alone are "
+            "not conflicts. Put valid discrepancies in conflict_details.\n"
+            "6. Source IDs start at 1.\n\n"
+            f"Aspect contracts: {json.dumps(aspect_contracts, ensure_ascii=False)}\n\n"
+            f"Candidate evidence: {material}"
         )
         try:
+            attempts = 1
+            if self._budget:
+                attempts = min(
+                    2,
+                    max(1, self._budget.max_llm_calls - self._budget.llm_calls),
+                )
             synthesis = self._structured(
                 prompt,
                 DeepSynthesis,
-                max_attempts=1,
-                model=self.planner_model,
+                max_attempts=attempts,
+                model=self.deep_planner_model,
                 stage="synthesis",
             )
         except (StructuredOutputError, SearchBudgetExceeded):
-            return self._fallback_deep_synthesis(pages)
+            self._log("stage=synthesis_rejected | reason=verification_failed")
+            return DeepSynthesis(insufficient_information=True)
         valid_facts = []
         for fact in synthesis.facts[:MAX_DEEP_FACTS]:
             source_ids = sorted({
                 source_id for source_id in fact.source_ids
                 if 1 <= source_id <= len(pages)
+                and self._fact_supported_by_candidates(fact, pages[source_id - 1])
             })
             if fact.claim and source_ids and not NEGATIVE_EVIDENCE.search(fact.claim):
                 valid_facts.append(DeepFact(
@@ -1874,8 +2079,7 @@ class WebSearchTool:
                     definition=_clip(fact.definition, 120),
                 ))
         if not valid_facts and any(page.facts for page in pages):
-            self._log("stage=synthesis_fallback | reason=empty_facts")
-            return self._fallback_deep_synthesis(pages)
+            self._log("stage=synthesis_rejected | reason=no_verified_facts")
         valid_conflicts = [
             _clip(item.description, 240)
             for item in synthesis.conflict_details[:4]
@@ -1884,8 +2088,21 @@ class WebSearchTool:
         return DeepSynthesis(
             facts=valid_facts,
             conflicts=valid_conflicts,
+            aspect_reviews=synthesis.aspect_reviews,
             insufficient_information=synthesis.insufficient_information or not valid_facts,
         )
+
+    def _fact_supported_by_candidates(self, fact: DeepFact,
+                                      page: NormalPageEvidence) -> bool:
+        claim_terms = self._quality_terms(fact.claim)
+        for candidate in page.facts:
+            candidate_terms = self._quality_terms(
+                f"{candidate.claim} {candidate.evidence}"
+            )
+            required = 1 if len(claim_terms) <= 3 else 2
+            if len(claim_terms & candidate_terms) >= required:
+                return True
+        return False
 
     @staticmethod
     def _valid_conflict(item: ConflictAssessment, source_count: int) -> bool:
@@ -1994,6 +2211,56 @@ class WebSearchTool:
             )
         return outcomes
 
+    def _reviewed_aspect_outcomes(self, aspects: list[ResearchAspect],
+                                  pages: list[NormalPageEvidence],
+                                  synthesis: DeepSynthesis) -> list[AspectOutcome]:
+        accepted_sources = {
+            source_id
+            for fact in synthesis.facts
+            for source_id in fact.source_ids
+        }
+        reviews = {item.name.casefold(): item for item in synthesis.aspect_reviews}
+        outcomes: list[AspectOutcome] = []
+        for aspect in aspects:
+            review = reviews.get(aspect.name.casefold())
+            bound_sources = {
+                source_id
+                for source_id, page in enumerate(pages, start=1)
+                if page.aspect_name == aspect.name
+            }
+            confirmed_sources = sorted(
+                set(review.source_ids if review else [])
+                & bound_sources
+                & accepted_sources
+            )
+            requested_status = (review.status.casefold() if review else "missing")
+            if requested_status == AspectStatus.CONFIRMED.value and confirmed_sources:
+                outcome = AspectOutcome(
+                    name=aspect.name,
+                    status=AspectStatus.CONFIRMED,
+                    source_id=confirmed_sources[0],
+                )
+            else:
+                has_candidates = any(
+                    page.facts for page in pages if page.aspect_name == aspect.name
+                )
+                status = AspectStatus.REJECTED if has_candidates else AspectStatus.MISSING
+                reason = review.reason if review else "PCC returned no aspect assessment"
+                outcome = AspectOutcome(
+                    name=aspect.name,
+                    status=status,
+                    failure_reason=_clip(
+                        reason or "no candidate passed PCC verification", 180
+                    ),
+                )
+            outcomes.append(outcome)
+            self._log(
+                f"stage=aspect | verifier=pcc | name={_clip(outcome.name, 60)} | "
+                f"status={outcome.status.value} | source={outcome.source_id or '-'} | "
+                f"reason={_clip(outcome.failure_reason, 100) or '-'}"
+            )
+        return outcomes
+
     def _run_deep(self, query: str, results: list[dict]) -> str:
         intent = self.last_intent or self._analyze_intent(query)
         aspect_names = self.last_plan.aspects if self.last_plan else [query]
@@ -2053,7 +2320,10 @@ class WebSearchTool:
             f"stage=extract_pages | mode=deep | pages={len(extracted)} | "
             f"workers={workers} | elapsed={time.monotonic() - started:.2f}s"
         )
-        outcomes = self._aspect_outcomes(research_aspects, selected, extracted)
+        synthesis = self._synthesize_deep(query, extracted)
+        outcomes = self._reviewed_aspect_outcomes(
+            research_aspects, extracted, synthesis
+        )
         coverage_gaps = [
             item.name for item in outcomes if item.status != AspectStatus.CONFIRMED
         ]
@@ -2062,7 +2332,6 @@ class WebSearchTool:
                 "stage=coverage_gaps | aspects="
                 + ",".join(_clip(aspect, 60) for aspect in coverage_gaps)
             )
-        synthesis = self._synthesize_deep(query, extracted)
         self._store_result(
             query, SearchMode.DEEP, selected, synthesis, coverage_gaps, outcomes
         )
@@ -2192,6 +2461,30 @@ class WebSearchTool:
                 "broad_conclusion_allowed": self.last_result.broad_conclusion_allowed
                 if self.last_result else None,
             }
+            agg = self._aggregate
+            agg["total"] += 1
+            if initial_mode == SearchMode.QUICK and mode == SearchMode.QUICK:
+                agg["quick"] += 1
+            elif initial_mode == SearchMode.QUICK and mode != SearchMode.QUICK:
+                agg["escalated"] += 1
+            if mode == SearchMode.NORMAL:
+                agg["normal"] += 1
+            elif mode == SearchMode.DEEP:
+                agg["deep"] += 1
+            if quick_quality:
+                agg["quick_score_sum"] += quick_quality.score
+            quick_total = agg["quick"] + agg["escalated"]
+            if agg["total"] % 10 == 0 and self.logger:
+                avg_score = (
+                    agg["quick_score_sum"] / quick_total if quick_total else 0
+                )
+                self._log(
+                    f"aggregate | total={agg['total']} | "
+                    f"quick_resolved={agg['quick']} | "
+                    f"quick_escalated={agg['escalated']} | "
+                    f"normal={agg['normal']} | deep={agg['deep']} | "
+                    f"avg_quick_score={avg_score:.1f}"
+                )
             self._log(
                 f"end | mode={mode.value} | llm_calls={budget.llm_calls}/"
                 f"{budget.max_llm_calls} | elapsed={budget.elapsed:.2f}s"

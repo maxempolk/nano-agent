@@ -18,8 +18,8 @@ CHARS_PER_TOKEN = 3
 COMPRESSED_TOOL_CHARS = 400  # до скольки сжимать старые tool-результаты
 MAX_SUMMARY_CHARS = 1400
 DEFAULT_COMPACT_PROMPT = (
-    "Summarize the transcript for future turns. Preserve goals, decisions, facts, "
-    "action results, errors, and pending work. Remove repetition. Do not invent."
+    "Суммируй транскрипт для будущих ходов. Сохрани цели, решения, факты, "
+    "результаты действий, ошибки и незавершённую работу. Убери повторы. Не выдумывай."
 )
 
 EXPLICIT_WEB_SEARCH = re.compile(
@@ -113,33 +113,58 @@ def _tool_names(tools: list) -> set[str]:
     }
 
 
-FINALIZER_SYSTEM = (
-    "You write a reader-facing answer from completed research using only supplied evidence. "
-    "Answer in the user's language. Start with a concise overall conclusion, then cover the "
-    "requested aspects with Markdown headings or bullets. Compare sources, explain genuine "
-    "conflicts, and state evidence gaps. Preserve source references and URLs. "
-    "If evidence says Broad conclusion allowed: no, begin by saying the research is partial, "
-    "identify missing aspects, and do not make an overall quality or winner judgment. "
-    "Return normal prose only: never emit JSON, a key-value schema, a code fence, a function call, or an "
-    "empty response."
+_FINALIZER_QUICK_SYSTEM = (
+    "Напиши ответ на вопрос, используя только предоставленные сниппеты.\n"
+    "Язык ответа = язык вопроса.\n"
+    "Начни с прямого ответа. Укажи источники."
+)
+
+_FINALIZER_RESEARCH_SYSTEM = (
+    "Напиши ответ на вопрос, используя только предоставленные факты.\n"
+    "Язык ответа = язык вопроса.\n"
+    "1. Начни с прямого ответа.\n"
+    "2. Если факты противоречат друг другу — укажи оба варианта с источниками.\n"
+    "3. Если исследование частичное (Broad conclusion allowed: no) — "
+    "скажи об этом и перечисли, чего не хватает.\n"
+    "4. Укажи источники."
+)
+
+_FINALIZER_EXAMPLE_USER = (
+    "Вопрос:\nкакая последняя версия Python?\n\n"
+    "Сниппеты:\n"
+    "[1] Python 3.13.2 released (python.org)\n"
+    "Python 3.13.2 is the latest stable release, published January 2025."
+)
+_FINALIZER_EXAMPLE_ASSISTANT = (
+    "Последняя стабильная версия — Python 3.13.2 (январь 2025). "
+    "Источник: python.org"
 )
 
 
 def _finalization_messages(user_input: str,
-                           evidence: list[tuple[str, str]]) -> list[dict]:
+                           evidence: list[tuple[str, str]],
+                           quick: bool = False) -> list[dict]:
     evidence_text = "\n\n".join(
         result for _, result in evidence
     )
-    return [
-        {"role": "system", "content": FINALIZER_SYSTEM},
-        {
-            "role": "user",
-            "content": (
-                f"User request:\n{user_input}\n\n"
-                f"Available tool evidence:\n{evidence_text or 'No tool evidence available.'}"
-            ),
-        },
+    system = _FINALIZER_QUICK_SYSTEM if quick else _FINALIZER_RESEARCH_SYSTEM
+    evidence_label = "Сниппеты" if quick else "Факты"
+    messages: list[dict] = [
+        {"role": "system", "content": system},
     ]
+    if re.search(r"[а-яё]", user_input, re.IGNORECASE):
+        messages.extend([
+            {"role": "user", "content": _FINALIZER_EXAMPLE_USER},
+            {"role": "assistant", "content": _FINALIZER_EXAMPLE_ASSISTANT},
+        ])
+    messages.append({
+        "role": "user",
+        "content": (
+            f"Вопрос:\n{user_input}\n\n"
+            f"{evidence_label}:\n{evidence_text or 'Нет данных.'}"
+        ),
+    })
+    return messages
 
 
 def _tool_evidence_fallback(evidence: list[tuple[str, str]],
@@ -180,10 +205,11 @@ def _validate_final_answer(content: str, user_input: str,
     ):
         return False, "partial_coverage_hidden"
     if re.search(r"[а-яё]", user_input, re.IGNORECASE):
-        cyrillic_chars = re.findall(r"[а-яё]", text, re.IGNORECASE)
         prose = re.sub(r"https?://\S+", "", text)
         prose = re.sub(r"\b[A-Z0-9][A-Z0-9._-]*\b", "", prose)
-        if len(cyrillic_chars) < 5 and re.search(r"\b[A-Za-z]{3,}\b", prose):
+        cyrillic_words = re.findall(r"[а-яё]{2,}", prose, re.IGNORECASE)
+        latin_words = re.findall(r"[A-Za-z]{3,}", prose)
+        if len(cyrillic_words) < 3 and len(latin_words) > len(cyrillic_words):
             return False, "language_mismatch"
     return True, "ok"
 
@@ -360,13 +386,14 @@ class Agent:
 
     def _finalize_research(self, user_input: str,
                            evidence: list[tuple[str, str]]) -> str:
-        messages = _finalization_messages(user_input, evidence)
         web_tool = self.tool_objects.get("web_search")
         structured_result = (
             getattr(web_tool, "last_result", None)
             if any(name == "web_search" for name, _ in evidence)
             else None
         )
+        is_quick = getattr(structured_result, "mode", "") == "quick"
+        messages = _finalization_messages(user_input, evidence, quick=is_quick)
         require_partial = bool(
             structured_result is not None
             and not getattr(structured_result, "broad_conclusion_allowed", True)

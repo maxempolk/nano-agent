@@ -132,6 +132,63 @@ Normal ранжирует все найденные страницы по пря
 устаревшие датированные утверждения отбрасываются. В результате указываются URL,
 официальность, год источника и дата факта, когда она присутствует на странице.
 
+## Сравнение локальных моделей
+
+`benchmarks/agent_model_eval.py` проверяет OpenAI-совместимую модель на реальных
+обязанностях этого агента, а не только на общих академических вопросах. Набор
+содержит 45 тестов в шести группах:
+
+- `routing` — выбор ответа, поиска, глубины поиска или локального инструмента;
+- `tools` — настоящий function call, корректные аргументы и безопасный отказ;
+- `extraction` — факты с дословным evidence, датами, отрицаниями и prompt injection;
+- `finalization` — русский итог из источников, конфликты и неполное покрытие;
+- `recovery` — исправленный вызов после ошибки и остановка после трёх неудач;
+- `compact` — сохранение решений, ошибок и pending work без секретов и устаревших гипотез.
+
+Пример полного запуска для Apple FM:
+
+```bash
+python -m benchmarks.agent_model_eval \
+  --provider fm \
+  --model system
+```
+
+Пример для LM Studio:
+
+```bash
+python -m benchmarks.agent_model_eval \
+  --base-url http://127.0.0.1:1234/v1 \
+  --model granite-4.0-h-tiny
+```
+
+Можно выбрать одну или несколько групп, сделать повторные прогоны и ограничить
+дорогой пилот:
+
+```bash
+python -m benchmarks.agent_model_eval --model system \
+  --suite tools --suite extraction --repeat 3
+python -m benchmarks.agent_model_eval --model system --limit-per-suite 2
+```
+
+По умолчанию structured-тесты сначала используют нативный `json_schema`. Если
+сервер его не поддерживает, режим `auto` повторяет запрос с явно отмеченным
+prompt-fallback. Для строгого сравнения транспорта используй
+`--structured-mode native` или `--structured-mode prompt`. JSONL с сырыми
+ответами и агрегированный отчёт записываются в `benchmark-results/`, который не
+попадает в git. Помимо качества отчёт показывает p50/p95 задержки, обычные и
+reasoning-токены, ошибки API и число schema-fallback.
+
+Для моделей `system`/`pcc` и адреса Apple bridge на порту `1976` runner
+автоматически добавляет требуемый AFM `x-order`; для остальных серверов остаётся
+стандартный JSON Schema. Это можно переопределить через
+`--schema-dialect standard|afm`. Поле `agent_ready` становится истинным только
+после прохождения минимального порога в каждой группе: высокий средний балл не
+скрывает провал tool calling, extraction или восстановления после ошибок.
+При `--provider fm` вызовы идут напрямую через `fm respond`, без `fm serve`.
+Поскольку `fm respond` не предоставляет native function calls, группы `tools`
+и `recovery` используют явно отмеченный schema-mediated tool decision; их нельзя
+считать полностью эквивалентными function calling через OpenAI-compatible API.
+
 ## Структура
 
 ```

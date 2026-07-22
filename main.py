@@ -7,6 +7,8 @@ import sys
 from dotenv import load_dotenv
 from openai import OpenAI
 
+load_dotenv()
+
 from core.agent import Agent
 from core.config import (
     APPLE_BASE_URL,
@@ -21,8 +23,6 @@ from core.model_router import AppleModelRouter, ModelRoute, resolve_model_mode
 from core.prompts import PROFILES, build_prompt_set
 from core.tools import cron as cron_tool
 from core.tools.web_search import WebSearchTool
-
-load_dotenv()
 
 parser = argparse.ArgumentParser(description="LLM Agent")
 interface = parser.add_mutually_exclusive_group()
@@ -142,15 +142,17 @@ logger.info(
     f"web_search={WEB_SEARCH_FORCE_DEPTH}"
 )
 
-# Hybrid: PCC планирует/синтезирует исследование, AFM извлекает страницы.
+# Hybrid: AFM планирует normal и извлекает страницы, PCC планирует/синтезирует deep.
 # Строгие local/server режимы не пересекают выбранную границу.
 search_worker_model = APPLE_PCC_MODEL if model_mode == "pcc" else APPLE_LOCAL_MODEL
-search_planner_model = APPLE_LOCAL_MODEL if model_mode == "local" else APPLE_PCC_MODEL
+search_planner_model = APPLE_PCC_MODEL if model_mode == "pcc" else APPLE_LOCAL_MODEL
+search_deep_planner = APPLE_LOCAL_MODEL if model_mode == "local" else APPLE_PCC_MODEL
 web_search = WebSearchTool(
     client,
     search_worker_model,
     model_mini=search_worker_model,
     planner_model=search_planner_model,
+    deep_planner_model=search_deep_planner,
     logger=logger,
     force_depth=None if WEB_SEARCH_FORCE_DEPTH == "auto" else WEB_SEARCH_FORCE_DEPTH,
 )

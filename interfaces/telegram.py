@@ -179,9 +179,10 @@ def _progress_message(tool_calls: list[tuple[str, str, str]], secret: str = "") 
 
 
 def _model_badge(agent: Agent) -> str:
+    model = agent.model or "unknown"
     if agent.last_route_name == "pcc":
-        return "\n\n<i>☁️ Apple PCC</i>"
-    return "\n\n<i>🍎 AFM Core 3 · local</i>"
+        return f"\n\n<i>☁️ {model}</i>"
+    return f"\n\n<i>🍎 {model}</i>"
 
 
 def _command_name(text: str) -> str:
