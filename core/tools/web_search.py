@@ -277,45 +277,12 @@ class ResearchResult(BaseModel):
         return "\n".join(lines)
 
     def render_fallback(self) -> str:
-        russian = bool(re.search(r"[а-яё]", self.query, re.IGNORECASE))
-        if russian:
-            lines = [
-                "По результатам поиска удалось подтвердить:"
-                if self.broad_conclusion_allowed
-                else "Исследование частичное: данных недостаточно для общего вывода."
-            ]
-            missing_title = "Не удалось надёжно проверить:"
-            conflicts_title = "Противоречия:"
-            sources_title = "Источники:"
-            empty = "Надёжных фактов по запросу найти не удалось."
-        else:
-            lines = [
-                "The research supports:"
-                if self.broad_conclusion_allowed
-                else "The research is partial: evidence is insufficient for a broad conclusion."
-            ]
-            missing_title = "Could not verify reliably:"
-            conflicts_title = "Conflicts:"
-            sources_title = "Sources:"
-            empty = "No reliable facts were found for the request."
-        if not self.facts:
-            lines = [empty]
-        for fact in self.facts:
-            refs = ",".join(str(source_id) for source_id in fact.source_ids)
-            date = f" ({fact.published_at})" if fact.published_at else ""
-            lines.append(f"- {fact.claim}{date} [{refs}]")
-        if self.conflicts:
-            lines.append(f"\n{conflicts_title}")
-            lines.extend(f"- {conflict}" for conflict in self.conflicts)
-        if self.coverage_gaps:
-            lines.append(f"\n{missing_title}")
-            lines.extend(f"- {aspect}" for aspect in self.coverage_gaps)
-        if self.sources:
-            lines.append(f"\n{sources_title}")
-            lines.extend(
-                f"[{source.source_id}] {source.title} — {source.url}"
-                for source in self.sources
-            )
+        if not self.sources:
+            return "Поиск не вернул результатов по этому запросу."
+        lines = ["По результатам поиска:"]
+        for source in self.sources[:5]:
+            title = source.title or source.url
+            lines.append(f"• {title} — {source.url}")
         return "\n".join(lines)
 
 
@@ -438,17 +405,6 @@ class SearchIntent:
         if should_restrict and "site:" not in query.lower():
             return f"{query} site:{self.official_domain}"
         return query
-
-
-@dataclass(frozen=True)
-class QuickQuality:
-    sufficient: bool
-    score: int
-    relevant_results: int
-    value_present: bool
-    fresh_present: bool
-    authoritative_present: bool
-    reasons: tuple[str, ...]
 
 
 class SearchBudgetExceeded(RuntimeError):
@@ -612,7 +568,7 @@ class WebSearchTool:
         self._budget: SearchBudget | None = None
         self._aggregate = {
             "total": 0, "quick": 0, "escalated": 0,
-            "normal": 0, "deep": 0, "quick_score_sum": 0,
+            "normal": 0, "deep": 0,
         }
 
     def _store_result(self, query: str, mode: SearchMode, results: list[dict],
@@ -985,36 +941,37 @@ class WebSearchTool:
         fallback = self._analyze_intent(query)
         if mode == SearchMode.DEEP:
             prompt = (
-                "Plan a deep web research. Decompose the question into aspects and "
-                "generate search queries that cover them.\n\n"
-                "Structure:\n"
-                "1. Put the main entity in subject. List each dimension as a short "
-                "English aspect.\n"
-                "2. Create 1-5 query objects. Each query targets one aspect with an "
-                "evidence contract: expected_evidence, requirement, priority (1-5), "
-                "freshness flag, preferred_source_type, acceptance_criteria.\n"
-                "3. Mirror the contracts in research_aspects in the same order as "
+                "Спланируй глубокое веб-исследование. Декомпозируй вопрос на аспекты "
+                "и создай поисковые запросы, покрывающие каждый аспект.\n\n"
+                "Структура:\n"
+                "1. Помести основной объект в subject. Каждое измерение — короткий "
+                "английский аспект.\n"
+                "2. Создай 1-5 объектов запросов. Каждый запрос нацелен на один аспект "
+                "с контрактом доказательств: expected_evidence, requirement, "
+                "priority (1-5), freshness, preferred_source_type, "
+                "acceptance_criteria.\n"
+                "3. Отрази контракты в research_aspects в том же порядке, что и "
                 "queries.\n"
-                "4. List primary-source domains in official_domains, ordered by how "
-                "many aspects each covers. At least half of queries should target "
-                "primary sources; the rest should be broad for independent evidence.\n\n"
-                "Rules:\n"
-                "- expected_value: use fact for broad questions; number, price, "
-                "weather, version, or date only when the entire question asks for "
-                "that single value type.\n"
-                "- requires_freshness: set true only when current data matters.\n"
-                "- official_domain: set only when exactly one primary domain is "
-                "relevant.\n\n"
-                f"Question: {query}"
+                "4. Перечисли домены первичных источников в official_domains. "
+                "Минимум половина запросов — на первичные источники.\n\n"
+                "Правила:\n"
+                "- expected_value: fact для широких вопросов; number, price, "
+                "weather, version или date только когда весь вопрос запрашивает "
+                "этот единственный тип значения.\n"
+                "- requires_freshness: true только когда важны актуальные данные.\n"
+                "- official_domain: только когда ровно один первичный домен "
+                "релевантен.\n\n"
+                f"Вопрос: {query}"
             )
             plan_model = self.deep_planner_model
         else:
             prompt = (
-                "Generate 1-2 short English search queries that will find the answer.\n"
-                "Put the main entity or topic in subject.\n"
-                "If one official site is the primary source, put its domain in "
-                "official_domain. Otherwise leave it empty.\n\n"
-                f"Question: {query}"
+                "Сгенерируй 1-2 коротких английских поисковых запроса, которые "
+                "найдут ответ.\n"
+                "Помести основной объект или тему в subject.\n"
+                "Если один официальный сайт — первичный источник, укажи его домен "
+                "в official_domain. Иначе оставь пустым.\n\n"
+                f"Вопрос: {query}"
             )
             plan_model = self.planner_model
         try:
@@ -1447,68 +1404,6 @@ class WebSearchTool:
         years = [int(year) for year in re.findall(r"\b20\d{2}\b", text)]
         return max(years, default=None)
 
-    def _assess_quick_quality(self, intent: SearchIntent,
-                              results: list[dict]) -> QuickQuality:
-        ranked = self._rank_quick_results(intent.original_query, results)
-        query_terms = self._quality_terms(intent.normalized_query)
-        preferred_domains = intent.preferred_domains or (
-            (intent.official_domain,) if intent.official_domain else ()
-        )
-        relevant = 0
-        value_present = False
-        fresh_present = False
-        authoritative_present = False
-
-        for result in ranked[:QUICK_RESULTS]:
-            overlap = len(query_terms & self._result_terms(result))
-            if len(query_terms) <= 1:
-                required_overlap = 0
-            elif len(query_terms) <= 3:
-                required_overlap = 1
-            else:
-                required_overlap = 2
-            if overlap >= required_overlap:
-                relevant += 1
-            text = f"{result.get('title', '')} {result.get('body', '')}"
-            value_present = value_present or self._contains_expected_value(intent, text)
-            fresh_present = fresh_present or self._contains_fresh_marker(text)
-            host = urlparse(result.get("href", "")).hostname or ""
-            authoritative_present = authoritative_present or bool(
-                _is_authoritative_host(host)
-                or host.endswith(".edu")
-            )
-
-        score = min(relevant, 3) * 10
-        if value_present:
-            score += 30
-        if fresh_present:
-            score += 20
-        if authoritative_present:
-            score += 20
-
-        sufficient = relevant >= 1
-        if intent.requires_freshness:
-            sufficient = sufficient and (fresh_present or authoritative_present) and score >= 50
-        else:
-            sufficient = sufficient and score >= 40
-
-        reasons = []
-        if relevant < 1:
-            reasons.append("no_relevant_results")
-        if intent.requires_freshness and not (fresh_present or authoritative_present):
-            reasons.append("freshness_unconfirmed")
-        if not reasons and not sufficient:
-            reasons.append("low_score")
-        return QuickQuality(
-            sufficient=sufficient,
-            score=score,
-            relevant_results=relevant,
-            value_present=value_present,
-            fresh_present=fresh_present,
-            authoritative_present=authoritative_present,
-            reasons=tuple(reasons),
-        )
-
     def _format_quick_results(self, query: str, results: list[dict]) -> str:
         ranked = self._rank_quick_results(query, results)
         lines = ["Quick web results (snippets only):"]
@@ -1605,17 +1500,17 @@ class WebSearchTool:
                 f"Acceptance criterion: {aspect.acceptance_criteria}\n\n"
             )
         prompt = (
-            "Extract up to 3 facts from this page that answer the question.\n"
-            "For each fact return:\n"
-            "- claim: the fact in one sentence\n"
-            "- evidence: exact short quote from the page supporting it\n"
-            "- published_at: date if the page states one, else empty\n"
-            "Use only information present on this page. "
-            "Return an empty facts list if nothing relevant is found.\n\n"
+            "Извлеки до 3 фактов с этой страницы, отвечающих на вопрос.\n"
+            "Для каждого факта верни:\n"
+            "- claim: факт одним предложением\n"
+            "- evidence: точная короткая цитата со страницы\n"
+            "- published_at: дата если указана на странице, иначе пусто\n"
+            "Используй только информацию с этой страницы. "
+            "Верни пустой список facts если ничего релевантного нет.\n\n"
             f"{aspect_text}"
-            f"Question: {question}\n"
-            f"Page: {result.get('title', '')} ({result.get('href', '')})\n\n"
-            f"Page content:\n{context}"
+            f"Вопрос: {question}\n"
+            f"Страница: {result.get('title', '')} ({result.get('href', '')})\n\n"
+            f"Содержимое страницы:\n{context}"
         )
         try:
             candidates = self._structured(prompt, CandidateExtraction, max_attempts=MAX_RETRIES)
@@ -2026,22 +1921,25 @@ class WebSearchTool:
             for source_id, page in enumerate(pages, start=1)
         ], ensure_ascii=False)
         prompt = (
-            f"Verify candidate facts for the research question: {question}\n\n"
-            "The candidates below come from a smaller extraction model and are "
-            "untrusted. Use only information present in the candidates.\n\n"
-            "Verification rules:\n"
-            "1. Reject vague, tangential, unsupported, outdated, or ambiguous facts.\n"
-            "2. A page can only confirm its bound_aspect.\n"
-            "3. Return one aspect_review per contract: confirmed (needs at least "
-            "one accepted fact with valid source_id), rejected, or missing.\n"
-            f"4. Return at most {MAX_DEEP_FACTS} accepted facts. Merge duplicates, "
-            "keep all supporting source_ids and dates.\n"
-            "5. A conflict is valid only when metric, unit, period, geography, and "
-            "definition are compatible. Different dates or definitions alone are "
-            "not conflicts. Put valid discrepancies in conflict_details.\n"
-            "6. Source IDs start at 1.\n\n"
-            f"Aspect contracts: {json.dumps(aspect_contracts, ensure_ascii=False)}\n\n"
-            f"Candidate evidence: {material}"
+            f"Верифицируй факты-кандидаты для исследовательского вопроса: {question}\n\n"
+            "Кандидаты получены от меньшей модели извлечения и недоверенны. "
+            "Используй только информацию из кандидатов.\n\n"
+            "Правила верификации:\n"
+            "1. Отклоняй размытые, касательные, неподтверждённые, устаревшие "
+            "или неоднозначные факты.\n"
+            "2. Страница может подтверждать только свой bound_aspect.\n"
+            "3. Верни один aspect_review на каждый контракт: confirmed (нужен "
+            "минимум один принятый факт с валидным source_id), rejected или "
+            "missing.\n"
+            f"4. Верни не более {MAX_DEEP_FACTS} принятых фактов. Объединяй "
+            "дубликаты, сохраняй все source_id и даты.\n"
+            "5. Конфликт валиден только при совместимых метрике, единице, "
+            "периоде, географии и определении. Разные даты или определения "
+            "сами по себе не конфликт. Валидные расхождения — в "
+            "conflict_details.\n"
+            "6. Source ID начинаются с 1.\n\n"
+            f"Контракты аспектов: {json.dumps(aspect_contracts, ensure_ascii=False)}\n\n"
+            f"Кандидаты доказательств: {material}"
         )
         try:
             attempts = 1
@@ -2360,7 +2258,6 @@ class WebSearchTool:
             f"official={intent.official_domain or '-'} | currency={intent.currency or '-'} | "
             f"search_query={_clip(self.last_query, 180)}"
         )
-        quick_quality: QuickQuality | None = None
 
         try:
             if mode == SearchMode.QUICK:
@@ -2370,37 +2267,6 @@ class WebSearchTool:
                         query=query, mode=mode.value, insufficient_information=True
                     )
                     return "Ничего не найдено."
-                quality = self._assess_quick_quality(intent, results)
-                quick_quality = quality
-                self._log(
-                    f"stage=quick_quality | sufficient={str(quality.sufficient).lower()} | "
-                    f"score={quality.score} | relevant={quality.relevant_results} | "
-                    f"value={str(quality.value_present).lower()} | "
-                    f"fresh={str(quality.fresh_present).lower()} | "
-                    f"authoritative={str(quality.authoritative_present).lower()} | "
-                    f"reasons={','.join(quality.reasons) or '-'}"
-                )
-                can_escalate = depth == "auto" and self.force_depth is None
-                if not quality.sufficient and can_escalate:
-                    mode = SearchMode.NORMAL
-                    normal_budget = SearchBudget.for_mode(mode)
-                    normal_budget.started_at = budget.started_at
-                    budget = normal_budget
-                    self._budget = budget
-                    self._log(
-                        "stage=escalate | from=quick | to=normal | "
-                        f"reason={','.join(quality.reasons) or 'low_score'}"
-                    )
-                    self.last_plan, intent = self._plan_research(query, mode)
-                    self.last_intent = intent
-                    self.last_query = intent.search_query()
-                    planned_results = self._search_many(self.last_plan.search_queries)
-                    if not planned_results:
-                        self.last_result = ResearchResult(
-                            query=query, mode=mode.value, insufficient_information=True
-                        )
-                        return "Ничего не найдено."
-                    return self._run_normal(query, planned_results)
                 ranked = self._rank_quick_results(query, results)
                 synthesis = DeepSynthesis(facts=[
                     DeepFact(
@@ -2454,8 +2320,6 @@ class WebSearchTool:
                 "official_domain": intent.official_domain,
                 "plan_aspects": list(self.last_plan.aspects) if self.last_plan else [],
                 "plan_queries": list(self.last_plan.search_queries) if self.last_plan else [],
-                "quick_quality_score": quick_quality.score if quick_quality else None,
-                "quick_quality_reasons": list(quick_quality.reasons) if quick_quality else [],
                 "aspect_statuses": dict(self.last_result.aspect_statuses)
                 if self.last_result else {},
                 "broad_conclusion_allowed": self.last_result.broad_conclusion_allowed
@@ -2471,19 +2335,12 @@ class WebSearchTool:
                 agg["normal"] += 1
             elif mode == SearchMode.DEEP:
                 agg["deep"] += 1
-            if quick_quality:
-                agg["quick_score_sum"] += quick_quality.score
-            quick_total = agg["quick"] + agg["escalated"]
             if agg["total"] % 10 == 0 and self.logger:
-                avg_score = (
-                    agg["quick_score_sum"] / quick_total if quick_total else 0
-                )
                 self._log(
                     f"aggregate | total={agg['total']} | "
                     f"quick_resolved={agg['quick']} | "
                     f"quick_escalated={agg['escalated']} | "
-                    f"normal={agg['normal']} | deep={agg['deep']} | "
-                    f"avg_quick_score={avg_score:.1f}"
+                    f"normal={agg['normal']} | deep={agg['deep']}"
                 )
             self._log(
                 f"end | mode={mode.value} | llm_calls={budget.llm_calls}/"

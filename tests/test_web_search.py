@@ -103,7 +103,7 @@ class WebSearchStructuredTests(TestCase):
         self.assertEqual(result.facts, [])
         self.assertEqual(mocked.call_count, 2)
         retry_prompt = mocked.call_args_list[1].args[2][0]["content"]
-        self.assertIn("previous response was invalid", retry_prompt)
+        self.assertIn("Previous response was invalid", retry_prompt)
 
     def test_structured_output_uses_native_schema_not_prompt_instructions(self):
         valid = '{"facts":[],"insufficient_information":true}'
@@ -128,7 +128,7 @@ class WebSearchStructuredTests(TestCase):
             response_format["json_schema"]["schema"]["properties"],
         )
 
-    def test_structured_retry_does_not_request_json_in_prompt(self):
+    def test_structured_retry_prompt_describes_error_and_requests_valid_json(self):
         valid = '{"facts":[],"insufficient_information":true}'
         with patch(
             "core.tools.web_search.call_llm",
@@ -137,8 +137,8 @@ class WebSearchStructuredTests(TestCase):
             self.tool._structured("extract", NormalPageEvidence)
 
         retry_prompt = mocked.call_args_list[1].args[2][0]["content"]
-        self.assertNotIn("JSON", retry_prompt.upper())
-        self.assertNotIn("Invalid response:", retry_prompt)
+        self.assertIn("Previous response was invalid JSON", retry_prompt)
+        self.assertIn("Return valid JSON with all required fields", retry_prompt)
 
     def test_empty_structured_response_exhausts_retries_then_raises(self):
         with patch(
@@ -202,8 +202,8 @@ class WebSearchStructuredTests(TestCase):
 
         rendered = result.render_fallback()
 
-        self.assertIn("Подтверждённый факт [1]", rendered)
-        self.assertIn("Не удалось надёжно проверить", rendered)
+        self.assertIn("По результатам поиска:", rendered)
+        self.assertIn("Official statistics", rendered)
         self.assertIn("https://example.test/statistics", rendered)
 
     def test_execute_processes_each_selected_page_separately(self):
@@ -270,42 +270,23 @@ class WebSearchStructuredTests(TestCase):
         self.assertIn("mode=quick", logged)
         self.assertIn("llm_calls=0/0", logged)
 
-    def test_low_quality_numeric_quick_escalates_internally_to_normal(self):
+    def test_low_quality_numeric_quick_stays_quick_without_escalation(self):
         results = [{
             "title": "Administrative divisions - Statistics Norway",
             "href": "https://www.ssb.no/en/regions",
             "body": "Updated in 2026. Information about Norway municipalities.",
         }]
-        evidence = NormalPageEvidence(
-            facts=[NormalFact(claim="Norway has 357 municipalities", evidence="357")],
-            insufficient_information=False,
-        )
 
         with patch.object(self.tool, "_search", return_value=results), \
-             patch.object(
-                 self.tool,
-                 "_plan_research",
-                 return_value=_planned(
-                     "сколько коммун в Норвегии?",
-                     search_queries=["current Norway municipality count"],
-                     expected=ExpectedValue.NUMBER,
-                     fresh=True,
-                     domain="ssb.no",
-                 ),
-             ), \
-             patch.object(self.tool, "_scrape", return_value="Norway has 357 municipalities"), \
-             patch.object(self.tool, "_extract_normal_page", return_value=evidence) as extract:
+             patch.object(self.tool, "_scrape") as scrape, \
+             patch.object(self.tool, "_extract_normal_page") as extract:
             result = self.tool.execute("сколько коммун в Норвегии?", depth="auto")
 
-        extract.assert_called_once()
-        self.assertIn("357", result)
-        self.assertEqual(self.tool.last_stats["initial_mode"], "quick")
-        self.assertEqual(self.tool.last_stats["mode"], "normal")
-        self.assertTrue(self.tool.last_stats["escalated"])
-        self.assertIn(
-            "no_relevant_results",
-            self.tool.last_stats["quick_quality_reasons"],
-        )
+        scrape.assert_not_called()
+        extract.assert_not_called()
+        self.assertIn("snippets only", result)
+        self.assertEqual(self.tool.last_stats["mode"], "quick")
+        self.assertFalse(self.tool.last_stats["escalated"])
 
     def test_date_number_is_not_mistaken_for_requested_count(self):
         intent = self.tool._analyze_intent("сколько коммун в Норвегии?")
@@ -1222,28 +1203,6 @@ class WebSearchStructuredTests(TestCase):
 
         self.assertTrue(self.tool._valid_conflict(valid, 2))
         self.assertFalse(self.tool._valid_conflict(missing_definition, 2))
-
-    def test_authoritative_fresh_source_sufficient_without_value_pattern(self):
-        results = [{
-            "title": "Python Releases for Windows",
-            "href": "https://www.python.org/downloads/windows/",
-            "body": "Latest Python 3 Release - Python 3.14.6 - June 10, 2026",
-        }]
-        intent = SearchIntent(
-            original_query="Какая последняя версия Python?",
-            normalized_query="Какая последняя версия Python?",
-            expected_value=ExpectedValue.VERSION,
-            requires_freshness=True,
-            official_requested=False,
-            official_domain="python.org",
-            preferred_domains=("python.org",),
-        )
-
-        quality = self.tool._assess_quick_quality(intent, results)
-
-        self.assertTrue(quality.sufficient)
-        self.assertTrue(quality.authoritative_present)
-        self.assertTrue(quality.fresh_present)
 
     def test_empty_structured_response_retries_through_general_path(self):
         valid = '{"facts":[],"insufficient_information":true}'

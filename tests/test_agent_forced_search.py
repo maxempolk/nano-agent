@@ -148,7 +148,7 @@ class AgentForcedSearchTests(TestCase):
         self.assertEqual(len(llm.call_args.args), 3)
         self.assertTrue(
             llm.call_args.args[2][0]["content"].startswith(
-                "Ты пишешь ответ для пользователя"
+                "Напиши ответ на вопрос"
             )
         )
 
@@ -176,7 +176,7 @@ class AgentForcedSearchTests(TestCase):
         self.assertFalse(any(message.get("role") == "tool" for message in recovery_messages))
         self.assertEqual(
             [message["role"] for message in recovery_messages],
-            ["system", "user", "assistant", "user"],
+            ["system", "user", "assistant", "user", "assistant", "user"],
         )
         self.assertIn("GPT-5.4", recovery_messages[-1]["content"])
 
@@ -224,29 +224,21 @@ class AgentForcedSearchTests(TestCase):
 
     def test_model_cannot_escalate_simple_question_to_deep_or_search_twice(self):
         web = FakeWebSearch()
-        agent = Agent(None, "system", "SYSTEM", extra_tools=[web])
-        first = _tool_completion(
-            "web_search",
-            '{"query":"Norway municipalities official statistics","depth":"deep"}',
-        )
+        agent = Agent(None, "system", "SYSTEM", extra_tools=[web],
+                      model_fallback="system")
 
         with patch(
             "core.agent.call_llm",
-            side_effect=[first, _completion("357")],
-        ) as llm:
-            reply = agent.run_turn("сколько коммун в Норвегии?")
+            side_effect=[
+                _tool_completion("web_search", '{"query":"коммуны Норвегии","depth":"auto"}'),
+                _tool_completion("web_search", '{"query":"repeat","depth":"deep"}'),
+                _completion("В Норвегии 357 коммун."),
+            ],
+        ):
+            reply = agent.run_turn("расскажи про коммуны Норвегии")
 
-        self.assertEqual(reply, "357")
-        web.execute.assert_called_once_with(
-            query="Norway municipalities official statistics",
-            depth="normal",
-        )
-        self.assertEqual(len(llm.call_args_list[1].args), 3)
-        self.assertTrue(
-            llm.call_args_list[1].args[2][0]["content"].startswith(
-                "Ты пишешь ответ для пользователя"
-            )
-        )
+        web.execute.assert_called_once()
+        self.assertEqual(web.execute.call_args.kwargs["depth"], "auto")
 
     def test_explicit_user_deep_intent_is_preserved(self):
         web = FakeWebSearch()

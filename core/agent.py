@@ -40,7 +40,12 @@ CHANGING_WEB_FACT = re.compile(
     r"\b(?:последн\w*|latest|newest)\b|"
     r"\b(?:кто|who)\b.{0,40}\b(?:сейча\w*|current)\b.{0,40}"
     r"\b(?:президент\w*|president|ceo)\b|"
-    r"\b(?:курс|погода|weather|exchange rate|stock price)\b)",
+    r"\b(?:курс|погода|weather|exchange rate|stock price)\b|"
+    r"\b(?:цена|цене|стоимость|price|cost)\b.{0,30}"
+    r"\b(?:битк\w*|bitcoin|btc|акци\w*|stock|iphone|айфон\w*)\b|"
+    r"\b(?:битк\w*|bitcoin|btc)\b.{0,30}"
+    r"\b(?:цена|цене|стоимость|курс|price|cost)\b|"
+    r"\bтоп\b.{0,20}\b(?:стран\w*|country|countries)\b)",
     re.IGNORECASE,
 )
 DEEP_SEARCH_INTENT = re.compile(
@@ -52,6 +57,11 @@ FORCED_DEEP_WEB_SEARCH = re.compile(
     r"(?:\b(?:подробн\w*|глубок\w*)\b.{0,30}\b(?:исслед\w*|изуч\w*|"
     r"проанализ\w*)\b|\bисследуй\b|\bсравни\w*\b.{0,45}\bисточник\w*\b|"
     r"\bdeep research\b|\bin-depth research\b)",
+    re.IGNORECASE,
+)
+FACTUAL_QUESTION = re.compile(
+    r"^\s*(?:кто|что|какой|какая|какое|какие|сколько|где|когда|чем|чей|чья|чьё|"
+    r"which|what|who|where|when|how many|how much)\b",
     re.IGNORECASE,
 )
 
@@ -113,14 +123,22 @@ def _tool_names(tools: list) -> set[str]:
     }
 
 
+SIMPLE_SYSTEM = (
+    "Ты — полезный ассистент. Отвечай кратко и точно на языке пользователя. "
+    "Если не уверен — скажи об этом."
+)
+
 _FINALIZER_QUICK_SYSTEM = (
-    "Напиши ответ на вопрос, используя только предоставленные сниппеты.\n"
+    "Напиши ответ на вопрос по предоставленным сниппетам.\n"
     "Язык ответа = язык вопроса.\n"
+    "Извлеки лучший доступный ответ из сниппетов, даже если данные неполные. "
+    "Не пиши «невозможно ответить», если сниппеты содержат релевантную информацию — "
+    "приведи то, что есть, с оговоркой о неполноте.\n"
     "Начни с прямого ответа. Укажи источники."
 )
 
 _FINALIZER_RESEARCH_SYSTEM = (
-    "Напиши ответ на вопрос, используя только предоставленные факты.\n"
+    "Напиши ответ на вопрос по предоставленным фактам.\n"
     "Язык ответа = язык вопроса.\n"
     "1. Начни с прямого ответа.\n"
     "2. Если факты противоречат друг другу — укажи оба варианта с источниками.\n"
@@ -132,12 +150,25 @@ _FINALIZER_RESEARCH_SYSTEM = (
 _FINALIZER_EXAMPLE_USER = (
     "Вопрос:\nкакая последняя версия Python?\n\n"
     "Сниппеты:\n"
-    "[1] Python 3.13.2 released (python.org)\n"
-    "Python 3.13.2 is the latest stable release, published January 2025."
+    "[1] Python 3.14.6 released (python.org)\n"
+    "Python 3.14.6 is the latest stable release, published June 2026."
 )
 _FINALIZER_EXAMPLE_ASSISTANT = (
-    "Последняя стабильная версия — Python 3.13.2 (январь 2025). "
+    "Последняя стабильная версия — Python 3.14.6 (июнь 2026). "
     "Источник: python.org"
+)
+
+_FINALIZER_EXAMPLE_USER_IMPERFECT = (
+    "Вопрос:\nкакой курс биткоина?\n\n"
+    "Сниппеты:\n"
+    "[1] Bitcoin price today (coinmarketcap.com)\n"
+    "BTC to USD exchange rate is $63,928.25. Growth of 3.4% in 24 hours.\n"
+    "[2] Курс Bitcoin (binance.com)\n"
+    "Текущая цена биткоина: $66,847.92 за 1 BTC."
+)
+_FINALIZER_EXAMPLE_ASSISTANT_IMPERFECT = (
+    "Курс биткоина: ~$63 900–66 800 (данные разнятся по источникам). "
+    "Источники: coinmarketcap.com, binance.com"
 )
 
 
@@ -156,6 +187,8 @@ def _finalization_messages(user_input: str,
         messages.extend([
             {"role": "user", "content": _FINALIZER_EXAMPLE_USER},
             {"role": "assistant", "content": _FINALIZER_EXAMPLE_ASSISTANT},
+            {"role": "user", "content": _FINALIZER_EXAMPLE_USER_IMPERFECT},
+            {"role": "assistant", "content": _FINALIZER_EXAMPLE_ASSISTANT_IMPERFECT},
         ])
     messages.append({
         "role": "user",
@@ -242,6 +275,7 @@ class Agent:
         self.last_search_query: str | None = None
         self.last_route_name = "local" if model == "system" else model
         self.last_route_reason = "fixed model"
+        self.last_route_score = 0
 
         self.tools = [bash.SCHEMA]
         self.handlers: dict = {"execute_bash": bash.execute}
@@ -271,6 +305,7 @@ class Agent:
         self.messages[0] = {"role": "system", "content": self.base_system}
         self.last_route_name = route.name
         self.last_route_reason = decision.reason
+        self.last_route_score = decision.score
         if self.logger:
             self.logger.info(
                 f"route={route.name} | model={route.model} | score={decision.score} | "
@@ -398,7 +433,7 @@ class Agent:
             structured_result is not None
             and not getattr(structured_result, "broad_conclusion_allowed", True)
         )
-        models = list(dict.fromkeys(filter(None, [self.model, self.model_fallback])))
+        models = list(dict.fromkeys(filter(None, [self.model_fallback, self.model])))
         for attempt, model in enumerate(models, start=1):
             if self.logger:
                 self.logger.info(
@@ -502,6 +537,17 @@ class Agent:
             # После гарантированного поиска этому ходу больше не нужны tools:
             # компактная AFM иначе пытается повторять web_search или curl через bash.
             turn_tools = []
+
+        simple_mode = (
+            self.route_selector is not None
+            and not search_completed
+            and self.last_route_score == 0
+        )
+        if simple_mode:
+            self.messages[0] = {"role": "system", "content": SIMPLE_SYSTEM}
+            turn_tools = []
+            if self.logger:
+                self.logger.info("simple_mode | minimal prompt, no tools")
 
         while True:
             self._compact_if_needed()
