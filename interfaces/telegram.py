@@ -1,10 +1,13 @@
 from __future__ import annotations
-from html import escape
+
 import json
 import re
 import time
-import httpx
+from html import escape
 from urllib.parse import quote_plus
+
+import httpx
+
 from core.agent import Agent
 from core.logger import SessionLogger
 
@@ -38,8 +41,7 @@ def _inline_markdown_to_html(text: str) -> str:
     text = re.sub(
         r"\[([^\]]+)\]\((https?://[^)\s]+)\)",
         lambda match: stash(
-            f'<a href="{escape(match.group(2), quote=True)}">'
-            f"{escape(match.group(1))}</a>"
+            f'<a href="{escape(match.group(2), quote=True)}">{escape(match.group(1))}</a>'
         ),
         text,
     )
@@ -62,9 +64,7 @@ def _markdown_to_telegram_html(markdown: str) -> str:
             if code_lines is None:
                 code_lines = []
             else:
-                output.append(
-                    f"<pre><code>{escape(chr(10).join(code_lines))}</code></pre>"
-                )
+                output.append(f"<pre><code>{escape(chr(10).join(code_lines))}</code></pre>")
                 code_lines = None
             continue
         if code_lines is not None:
@@ -81,9 +81,7 @@ def _markdown_to_telegram_html(markdown: str) -> str:
             continue
         quote = re.match(r"^\s*>\s?(.*)$", line)
         if quote:
-            output.append(
-                f"<blockquote>{_inline_markdown_to_html(quote.group(1))}</blockquote>"
-            )
+            output.append(f"<blockquote>{_inline_markdown_to_html(quote.group(1))}</blockquote>")
             continue
         output.append(_inline_markdown_to_html(line))
 
@@ -141,8 +139,9 @@ def _tool_action(name: str, arguments: str) -> str:
     return "выполняет операцию"
 
 
-def _messages_with_tool_trace(reply: str, tool_calls: list[tuple[str, str, str]],
-                              secret: str = "") -> list[str]:
+def _messages_with_tool_trace(
+    reply: str, tool_calls: list[tuple[str, str, str]], secret: str = ""
+) -> list[str]:
     if not reply.strip():
         reply = "Модель не сформировала текстовый ответ. Результаты инструментов приведены ниже."
     trace = _format_tool_trace(tool_calls, secret=secret)
@@ -160,21 +159,17 @@ def _progress_message(tool_calls: list[tuple[str, str, str]], secret: str = "") 
     for index, (name, arguments, _) in enumerate(visible, start=1):
         if secret:
             arguments = arguments.replace(secret, "[скрыто]")
-        action = escape(_shorten(
-            _tool_action(name, arguments), MAX_PROGRESS_ACTION_CHARS
-        )).replace("\n", " ")
-        completed_rows.append(
-            f"{index}. ✓ <code>{escape(name)}</code> — <i>{action}</i>"
+        action = escape(_shorten(_tool_action(name, arguments), MAX_PROGRESS_ACTION_CHARS)).replace(
+            "\n", " "
         )
+        completed_rows.append(f"{index}. ✓ <code>{escape(name)}</code> — <i>{action}</i>")
     completed = "\n".join(completed_rows)
     omitted = len(tool_calls) - len(visible)
     if omitted:
         completed = f"… ещё {omitted}\n" + completed
 
     return (
-        "🧠 <b>Продолжаю работу…</b>\n"
-        f"{completed}\n\n"
-        "<i>Инструменты завершены, формирую ответ.</i>"
+        f"🧠 <b>Продолжаю работу…</b>\n{completed}\n\n<i>Инструменты завершены, формирую ответ.</i>"
     )
 
 
@@ -204,8 +199,9 @@ def _context_command_reply(agent: Agent, command: str) -> str | None:
     return None
 
 
-def _telegram_post(base: str, method: str, data: dict,
-                   logger: SessionLogger | None = None) -> dict | None:
+def _telegram_post(
+    base: str, method: str, data: dict, logger: SessionLogger | None = None
+) -> dict | None:
     try:
         response = httpx.post(f"{base}/{method}", data=data, timeout=10)
         response.raise_for_status()
@@ -224,38 +220,59 @@ def _telegram_post(base: str, method: str, data: dict,
         return None
 
 
-def _send_message(base: str, chat_id: int, message: str,
-                  logger: SessionLogger | None = None) -> int | None:
-    payload = _telegram_post(base, "sendMessage", {
-        "chat_id": chat_id,
-        "text": message,
-        "parse_mode": "HTML",
-    }, logger)
+def _send_message(
+    base: str, chat_id: int, message: str, logger: SessionLogger | None = None
+) -> int | None:
+    payload = _telegram_post(
+        base,
+        "sendMessage",
+        {
+            "chat_id": chat_id,
+            "text": message,
+            "parse_mode": "HTML",
+        },
+        logger,
+    )
     if not payload:
         return None
     message_id = payload.get("result", {}).get("message_id")
     return message_id if isinstance(message_id, int) else None
 
 
-def _edit_message(base: str, chat_id: int, message_id: int, message: str,
-                  logger: SessionLogger | None = None) -> bool:
-    return _telegram_post(base, "editMessageText", {
-        "chat_id": chat_id,
-        "message_id": message_id,
-        "text": message,
-        "parse_mode": "HTML",
-    }, logger) is not None
+def _edit_message(
+    base: str, chat_id: int, message_id: int, message: str, logger: SessionLogger | None = None
+) -> bool:
+    return (
+        _telegram_post(
+            base,
+            "editMessageText",
+            {
+                "chat_id": chat_id,
+                "message_id": message_id,
+                "text": message,
+                "parse_mode": "HTML",
+            },
+            logger,
+        )
+        is not None
+    )
 
 
-def _send_messages(base: str, chat_id: int, messages: list[str],
-                   logger: SessionLogger | None = None) -> None:
+def _send_messages(
+    base: str, chat_id: int, messages: list[str], logger: SessionLogger | None = None
+) -> None:
     for message in messages:
         if _send_message(base, chat_id, message, logger) is None:
             break
 
 
-def _deliver_final(base: str, chat_id: int, status_message_id: int | None,
-                   messages: list[str], logger: SessionLogger | None = None) -> None:
+def _deliver_final(
+    base: str,
+    chat_id: int,
+    status_message_id: int | None,
+    messages: list[str],
+    logger: SessionLogger | None = None,
+) -> None:
     messages = [message for message in messages if message.strip()]
     if not messages:
         messages = ["Не удалось сформировать ответ. Попробуйте повторить запрос."]
@@ -266,7 +283,9 @@ def _deliver_final(base: str, chat_id: int, status_message_id: int | None,
     _send_messages(base, chat_id, messages, logger)
 
 
-def run(agent: Agent, token: str, allowed_user_id: str, logger: SessionLogger | None = None) -> None:
+def run(
+    agent: Agent, token: str, allowed_user_id: str, logger: SessionLogger | None = None
+) -> None:
     base = f"https://api.telegram.org/bot{token}"
 
     # Пропускаем накопленные сообщения — обрабатываем только новые
@@ -286,9 +305,7 @@ def run(agent: Agent, token: str, allowed_user_id: str, logger: SessionLogger | 
     while True:
         try:
             resp = httpx.get(
-                f"{base}/getUpdates",
-                params={"timeout": 30, "offset": offset},
-                timeout=35
+                f"{base}/getUpdates", params={"timeout": 30, "offset": offset}, timeout=35
             )
             updates = resp.json().get("result", [])
         except Exception as e:
@@ -352,9 +369,7 @@ def run(agent: Agent, token: str, allowed_user_id: str, logger: SessionLogger | 
                             logger,
                         )
 
-                reply = _markdown_to_telegram_html(
-                    agent.run_turn(text, on_tool_call=on_tool_call)
-                )
+                reply = _markdown_to_telegram_html(agent.run_turn(text, on_tool_call=on_tool_call))
                 reply += _model_badge(agent)
                 if agent.last_search_query:
                     url = f"https://duckduckgo.com/?q={quote_plus(agent.last_search_query)}"

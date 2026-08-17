@@ -2,13 +2,14 @@
 """Test script for agent interaction."""
 
 from dotenv import load_dotenv
+
 load_dotenv()
 
 from openai import OpenAI
+
 from core.agent import Agent
 from core.config import APPLE_BASE_URL, APPLE_LOCAL_MODEL
 from core.tools.web_search import WebSearchTool
-from core.tools import bash
 
 # Create client
 client = OpenAI(base_url=APPLE_BASE_URL, api_key="apple-local")

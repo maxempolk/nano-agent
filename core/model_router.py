@@ -1,14 +1,17 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
 import re
+from dataclasses import dataclass, replace
 
 
-def resolve_model_mode(*, cli_model: str | None = None, local: bool = False,
-                       server: bool = False, env_mode: str | None = None) -> str:
-    requested = "local" if local else "server" if server else (
-        cli_model or env_mode or "hybrid"
-    )
+def resolve_model_mode(
+    *,
+    cli_model: str | None = None,
+    local: bool = False,
+    server: bool = False,
+    env_mode: str | None = None,
+) -> str:
+    requested = "local" if local else "server" if server else (cli_model or env_mode or "hybrid")
     mode = {"auto": "hybrid", "server": "pcc"}.get(requested, requested)
     if mode not in {"hybrid", "local", "pcc"}:
         raise ValueError(f"Неизвестный режим модели: {requested}")

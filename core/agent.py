@@ -1,11 +1,14 @@
 from __future__ import annotations
-from openai import OpenAI, BadRequestError, RateLimitError
-from typing import TYPE_CHECKING, Callable
+
 import json
 import re
+from collections.abc import Callable
+from typing import TYPE_CHECKING
 
-from core.tools import bash
+from openai import BadRequestError, OpenAI, RateLimitError
+
 from core.llm import call_llm
+from core.tools import bash
 
 if TYPE_CHECKING:
     from core.logger import SessionLogger
@@ -109,18 +112,11 @@ def _forced_web_search_depth(user_input: str) -> str:
 
 
 def _without_tool(tools: list, name: str) -> list:
-    return [
-        tool for tool in tools
-        if tool.get("function", {}).get("name") != name
-    ]
+    return [tool for tool in tools if tool.get("function", {}).get("name") != name]
 
 
 def _tool_names(tools: list) -> set[str]:
-    return {
-        name
-        for tool in tools
-        if (name := tool.get("function", {}).get("name"))
-    }
+    return {name for tool in tools if (name := tool.get("function", {}).get("name"))}
 
 
 SIMPLE_SYSTEM = (
@@ -154,8 +150,7 @@ _FINALIZER_EXAMPLE_USER = (
     "Python 3.14.6 is the latest stable release, published June 2026."
 )
 _FINALIZER_EXAMPLE_ASSISTANT = (
-    "Последняя стабильная версия — Python 3.14.6 (июнь 2026). "
-    "Источник: python.org"
+    "Последняя стабильная версия — Python 3.14.6 (июнь 2026). Источник: python.org"
 )
 
 _FINALIZER_EXAMPLE_USER_IMPERFECT = (
@@ -172,36 +167,36 @@ _FINALIZER_EXAMPLE_ASSISTANT_IMPERFECT = (
 )
 
 
-def _finalization_messages(user_input: str,
-                           evidence: list[tuple[str, str]],
-                           quick: bool = False) -> list[dict]:
-    evidence_text = "\n\n".join(
-        result for _, result in evidence
-    )
+def _finalization_messages(
+    user_input: str, evidence: list[tuple[str, str]], quick: bool = False
+) -> list[dict]:
+    evidence_text = "\n\n".join(result for _, result in evidence)
     system = _FINALIZER_QUICK_SYSTEM if quick else _FINALIZER_RESEARCH_SYSTEM
     evidence_label = "Сниппеты" if quick else "Факты"
     messages: list[dict] = [
         {"role": "system", "content": system},
     ]
     if re.search(r"[а-яё]", user_input, re.IGNORECASE):
-        messages.extend([
-            {"role": "user", "content": _FINALIZER_EXAMPLE_USER},
-            {"role": "assistant", "content": _FINALIZER_EXAMPLE_ASSISTANT},
-            {"role": "user", "content": _FINALIZER_EXAMPLE_USER_IMPERFECT},
-            {"role": "assistant", "content": _FINALIZER_EXAMPLE_ASSISTANT_IMPERFECT},
-        ])
-    messages.append({
-        "role": "user",
-        "content": (
-            f"Вопрос:\n{user_input}\n\n"
-            f"{evidence_label}:\n{evidence_text or 'Нет данных.'}"
-        ),
-    })
+        messages.extend(
+            [
+                {"role": "user", "content": _FINALIZER_EXAMPLE_USER},
+                {"role": "assistant", "content": _FINALIZER_EXAMPLE_ASSISTANT},
+                {"role": "user", "content": _FINALIZER_EXAMPLE_USER_IMPERFECT},
+                {"role": "assistant", "content": _FINALIZER_EXAMPLE_ASSISTANT_IMPERFECT},
+            ]
+        )
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                f"Вопрос:\n{user_input}\n\n{evidence_label}:\n{evidence_text or 'Нет данных.'}"
+            ),
+        }
+    )
     return messages
 
 
-def _tool_evidence_fallback(evidence: list[tuple[str, str]],
-                            structured_result=None) -> str:
+def _tool_evidence_fallback(evidence: list[tuple[str, str]], structured_result=None) -> str:
     if structured_result is not None and hasattr(structured_result, "render_fallback"):
         rendered = structured_result.render_fallback()
         if rendered.strip():
@@ -218,8 +213,9 @@ def _tool_evidence_fallback(evidence: list[tuple[str, str]],
     )
 
 
-def _validate_final_answer(content: str, user_input: str,
-                           require_partial: bool = False) -> tuple[bool, str]:
+def _validate_final_answer(
+    content: str, user_input: str, require_partial: bool = False
+) -> tuple[bool, str]:
     text = content.strip()
     if not text:
         return False, "empty"
@@ -248,16 +244,22 @@ def _validate_final_answer(content: str, user_input: str,
 
 
 class Agent:
-    def __init__(self, client: OpenAI, model: str, system: str,
-                 compact_keep_messages: int = 10, max_tool_output: int = 2000,
-                 logger: SessionLogger | None = None,
-                 extra_tools: list | None = None,
-                 model_fallback: str | None = None,
-                 token_budget: int = DEFAULT_TOKEN_BUDGET,
-                 compact_prompt: str = DEFAULT_COMPACT_PROMPT,
-                 compact_trigger_ratio: float = COMPACT_TRIGGER_RATIO,
-                 route_selector: Callable[[str], RouteDecision] | None = None,
-                 compact_model: str | None = None):
+    def __init__(
+        self,
+        client: OpenAI,
+        model: str,
+        system: str,
+        compact_keep_messages: int = 10,
+        max_tool_output: int = 2000,
+        logger: SessionLogger | None = None,
+        extra_tools: list | None = None,
+        model_fallback: str | None = None,
+        token_budget: int = DEFAULT_TOKEN_BUDGET,
+        compact_prompt: str = DEFAULT_COMPACT_PROMPT,
+        compact_trigger_ratio: float = COMPACT_TRIGGER_RATIO,
+        route_selector: Callable[[str], RouteDecision] | None = None,
+        compact_model: str | None = None,
+    ):
         self.client = client
         self.model = model
         self.model_fallback = model_fallback
@@ -280,7 +282,7 @@ class Agent:
         self.tools = [bash.SCHEMA]
         self.handlers: dict = {"execute_bash": bash.execute}
         self.tool_objects: dict = {}
-        for tool in (extra_tools or []):
+        for tool in extra_tools or []:
             self.tools.append(tool.SCHEMA)  # type: ignore
             name = tool.SCHEMA["function"]["name"]  # type: ignore
             self.handlers[name] = tool.execute
@@ -333,9 +335,7 @@ class Agent:
                 calls = []
                 for call in tool_calls:
                     function = call.get("function", {}) if isinstance(call, dict) else {}
-                    calls.append(
-                        f"{function.get('name', 'tool')}({function.get('arguments', '')})"
-                    )
+                    calls.append(f"{function.get('name', 'tool')}({function.get('arguments', '')})")
                 content = f"{content}\nTool calls: {'; '.join(calls)}".strip()
             rows.append(f"[{role}] {content}")
         return "\n\n".join(rows)
@@ -348,7 +348,8 @@ class Agent:
 
     def _shrink_tool_results(self) -> None:
         tool_indices = [
-            i for i, message in enumerate(self.messages)
+            i
+            for i, message in enumerate(self.messages)
             if isinstance(message, dict) and message.get("role") == "tool"
         ]
         for i in tool_indices[:-1]:
@@ -364,7 +365,8 @@ class Agent:
             return False
 
         user_indices = [
-            i for i, message in enumerate(self.messages)
+            i
+            for i, message in enumerate(self.messages)
             if _message_dict(message).get("role") == "user"
         ]
         if not user_indices:
@@ -414,13 +416,11 @@ class Agent:
         after = _estimate_tokens(self._context_messages(), self.tools)
         if self.logger and after < before:
             self.logger.info(
-                f"Контекст compact: ~{before} → ~{after} токенов, "
-                f"записей={len(self.messages)}"
+                f"Контекст compact: ~{before} → ~{after} токенов, записей={len(self.messages)}"
             )
         return True
 
-    def _finalize_research(self, user_input: str,
-                           evidence: list[tuple[str, str]]) -> str:
+    def _finalize_research(self, user_input: str, evidence: list[tuple[str, str]]) -> str:
         web_tool = self.tool_objects.get("web_search")
         structured_result = (
             getattr(web_tool, "last_result", None)
@@ -514,24 +514,27 @@ class Agent:
             structured_result = getattr(tool_obj, "last_result", None)
             evidence_result = (
                 structured_result.evidence_text()
-                if structured_result is not None
-                and hasattr(structured_result, "evidence_text")
+                if structured_result is not None and hasattr(structured_result, "evidence_text")
                 else result
             )
             turn_evidence.append(("web_search", evidence_result))
 
-            self.messages.extend([
-                {
-                    "role": "assistant",
-                    "content": "",
-                    "tool_calls": [{
-                        "id": call_id,
-                        "type": "function",
-                        "function": {"name": "web_search", "arguments": arguments},
-                    }],
-                },
-                {"role": "tool", "tool_call_id": call_id, "content": result},
-            ])
+            self.messages.extend(
+                [
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": call_id,
+                                "type": "function",
+                                "function": {"name": "web_search", "arguments": arguments},
+                            }
+                        ],
+                    },
+                    {"role": "tool", "tool_call_id": call_id, "content": result},
+                ]
+            )
             tool_calls_made = 1
             search_completed = True
             # После гарантированного поиска этому ходу больше не нужны tools:
@@ -539,9 +542,7 @@ class Agent:
             turn_tools = []
 
         simple_mode = (
-            self.route_selector is not None
-            and not search_completed
-            and self.last_route_score == 0
+            self.route_selector is not None and not search_completed and self.last_route_score == 0
         )
         if simple_mode:
             self.messages[0] = {"role": "system", "content": SIMPLE_SYSTEM}
@@ -565,7 +566,9 @@ class Agent:
             except BadRequestError as e:
                 if "tool_use_failed" in str(e):
                     if self.logger:
-                        self.logger.error(f"tool_use_failed (tool_calls={tool_calls_made}), retry without tools")
+                        self.logger.error(
+                            f"tool_use_failed (tool_calls={tool_calls_made}), retry without tools"
+                        )
                     response = call_llm(self.client, self.model, windowed)  # type: ignore
                 else:
                     if self.logger:
@@ -574,7 +577,9 @@ class Agent:
             except RateLimitError as e:
                 if self.model_fallback:
                     if self.logger:
-                        self.logger.error(f"RateLimitError на {self.model}, переключаюсь на {self.model_fallback}: {e}")
+                        self.logger.error(
+                            f"RateLimitError на {self.model}, переключаюсь на {self.model_fallback}: {e}"
+                        )
                     try:
                         response = call_llm(self.client, self.model_fallback, windowed, turn_tools)  # type: ignore
                     except Exception as e2:
@@ -609,7 +614,8 @@ class Agent:
             if message.tool_calls:
                 allowed_tools = _tool_names(turn_tools)
                 forbidden_calls = [
-                    call for call in message.tool_calls
+                    call
+                    for call in message.tool_calls
                     if (
                         call.function.name not in allowed_tools
                         or (call.function.name == "web_search" and search_completed)
@@ -638,11 +644,7 @@ class Agent:
 
                 self.messages.append(message)  # type: ignore
                 first_web_call_id = next(
-                    (
-                        call.id
-                        for call in message.tool_calls
-                        if call.function.name == "web_search"
-                    ),
+                    (call.id for call in message.tool_calls if call.function.name == "web_search"),
                     None,
                 )
                 if first_web_call_id:
@@ -653,11 +655,13 @@ class Agent:
                 for call in message.tool_calls:
                     if tool_calls_made >= MAX_TOOL_CALLS_PER_TURN:
                         result = "Пропущено: достигнут лимит инструментов за один ход."
-                        self.messages.append({
-                            "role": "tool",
-                            "tool_call_id": call.id,
-                            "content": result,
-                        })
+                        self.messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call.id,
+                                "content": result,
+                            }
+                        )
                         continue
 
                     if first_web_call_id and call.id != first_web_call_id:
@@ -667,14 +671,15 @@ class Agent:
                         )
                         if self.logger:
                             self.logger.info(
-                                f"tool skipped after batched web_search | "
-                                f"name={call.function.name}"
+                                f"tool skipped after batched web_search | name={call.function.name}"
                             )
-                        self.messages.append({
-                            "role": "tool",
-                            "tool_call_id": call.id,
-                            "content": result,
-                        })
+                        self.messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call.id,
+                                "content": result,
+                            }
+                        )
                         continue
 
                     try:
@@ -683,18 +688,16 @@ class Agent:
                             raise ValueError("arguments must be a JSON object")
                     except (json.JSONDecodeError, ValueError) as error:
                         args = {}
-                        result = (
-                            f"Ошибка аргументов инструмента {call.function.name}: {error}"
-                        )
+                        result = f"Ошибка аргументов инструмента {call.function.name}: {error}"
                         if self.logger:
-                            self.logger.info(
-                                f"invalid tool arguments | name={call.function.name}"
-                            )
-                        self.messages.append({
-                            "role": "tool",
-                            "tool_call_id": call.id,
-                            "content": result,
-                        })
+                            self.logger.info(f"invalid tool arguments | name={call.function.name}")
+                        self.messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": call.id,
+                                "content": result,
+                            }
+                        )
                         tool_calls_made += 1
                         continue
                     if (
@@ -746,11 +749,9 @@ class Agent:
                             evidence_result = structured_result.evidence_text()
                     turn_evidence.append((call.function.name, evidence_result))
 
-                    self.messages.append({
-                        "role": "tool",
-                        "tool_call_id": call.id,
-                        "content": result
-                    })
+                    self.messages.append(
+                        {"role": "tool", "tool_call_id": call.id, "content": result}
+                    )
                     tool_calls_made += 1
             else:
                 reply = message.content or ""

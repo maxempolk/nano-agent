@@ -1,6 +1,5 @@
 import os
 
-
 APPLE_BASE_URL = os.environ.get("LLM_BASE_URL", "http://127.0.0.1:1976/v1")
 
 # Defaults target Apple FM; environment overrides can temporarily use another

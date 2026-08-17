@@ -1,19 +1,19 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
-from copy import deepcopy
-from dataclasses import asdict, dataclass
-from datetime import datetime, timezone
 import json
 import math
 import os
-from pathlib import Path
 import re
 import statistics
 import subprocess
 import tempfile
 import time
+from collections import defaultdict
+from copy import deepcopy
+from dataclasses import asdict, dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -22,7 +22,6 @@ from openai import OpenAI
 
 from benchmarks.agent_cases import BenchmarkCase, cases_for
 from core.llm import _normalize_completion
-
 
 STRUCTURED_SUITES = {"routing", "extraction"}
 VALID_SUITES = {"routing", "tools", "extraction", "finalization", "recovery", "compact"}
@@ -87,7 +86,7 @@ def _json_object(text: str) -> dict[str, Any]:
     start, end = stripped.find("{"), stripped.rfind("}")
     if start < 0 or end < start:
         raise ValueError("JSON object not found")
-    parsed = json.loads(stripped[start:end + 1])
+    parsed = json.loads(stripped[start : end + 1])
     if not isinstance(parsed, dict):
         raise ValueError("top-level JSON must be an object")
     return parsed
@@ -96,24 +95,36 @@ def _json_object(text: str) -> dict[str, Any]:
 def _tool_calls(message: Any) -> list[dict[str, Any]]:
     calls = []
     for call in message.tool_calls or []:
-        calls.append({
-            "id": call.id,
-            "name": call.function.name,
-            "arguments": call.function.arguments or "{}",
-        })
+        calls.append(
+            {
+                "id": call.id,
+                "name": call.function.name,
+                "arguments": call.function.arguments or "{}",
+            }
+        )
     return calls
 
 
 class BenchmarkClient:
-    def __init__(self, *, base_url: str, api_key: str, model: str,
-                 structured_mode: str, temperature: float, timeout: float,
-                 max_tokens_override: int | None = None,
-                 schema_dialect: str = "auto", provider: str = "openai",
-                 system_suffix: str = ""):
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        api_key: str,
+        model: str,
+        structured_mode: str,
+        temperature: float,
+        timeout: float,
+        max_tokens_override: int | None = None,
+        schema_dialect: str = "auto",
+        provider: str = "openai",
+        system_suffix: str = "",
+    ):
         self.provider = provider
         self.client = (
             OpenAI(base_url=base_url, api_key=api_key, timeout=timeout, max_retries=0)
-            if provider in {"openai", "lmstudio"} else None
+            if provider in {"openai", "lmstudio"}
+            else None
         )
         self.base_url = base_url
         self.system_suffix = system_suffix.strip()
@@ -124,8 +135,7 @@ class BenchmarkClient:
         self.max_tokens_override = max_tokens_override
         if schema_dialect == "auto":
             schema_dialect = (
-                "afm" if model in {"system", "pcc"} or ":1976/" in base_url
-                else "standard"
+                "afm" if model in {"system", "pcc"} or ":1976/" in base_url else "standard"
             )
         self.schema_dialect = schema_dialect
 
@@ -190,14 +200,14 @@ class BenchmarkClient:
             return self._request_fm(case)
         messages = [dict(message) for message in case.messages]
         if self.system_suffix:
-            system_message = next((message for message in messages if message.get("role") == "system"), None)
+            system_message = next(
+                (message for message in messages if message.get("role") == "system"), None
+            )
             if system_message is None:
                 messages.insert(0, {"role": "system", "content": self.system_suffix})
             else:
                 system_message["content"] = (
-                    str(system_message.get("content", "")).rstrip()
-                    + "\n"
-                    + self.system_suffix
+                    str(system_message.get("content", "")).rstrip() + "\n" + self.system_suffix
                 )
         schema_transport = "none"
         response_format = None
@@ -214,14 +224,16 @@ class BenchmarkClient:
                 }
             else:
                 schema_transport = "prompt"
-                messages.append({
-                    "role": "user",
-                    "content": (
-                        "Return one JSON object matching this JSON Schema exactly. "
-                        "Do not use a code fence.\n"
-                        + json.dumps(case.response_schema, ensure_ascii=False)
-                    ),
-                })
+                messages.append(
+                    {
+                        "role": "user",
+                        "content": (
+                            "Return one JSON object matching this JSON Schema exactly. "
+                            "Do not use a code fence.\n"
+                            + json.dumps(case.response_schema, ensure_ascii=False)
+                        ),
+                    }
+                )
 
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -289,9 +301,9 @@ class BenchmarkClient:
                 "\n\nOffered tools:\n"
                 + json.dumps(case.tools, ensure_ascii=False)
                 + "\nChoose whether to call one tool. Put its exact name in tool_name. For "
-                  "web_search fill query and depth; for execute_bash fill command. Leave unused "
-                  "fields empty. If no tool is needed, set "
-                  "call_tool=false and write the answer in response."
+                "web_search fill query and depth; for execute_bash fill command. Leave unused "
+                "fields empty. If no tool is needed, set "
+                "call_tool=false and write the answer in response."
             )
 
         schema_path = None
@@ -327,11 +339,13 @@ class BenchmarkClient:
                         if name == "web_search"
                         else {"command": data.get("command", "")}
                     )
-                    calls.append({
-                        "id": "fm-schema-tool-call",
-                        "name": name,
-                        "arguments": json.dumps(arguments, ensure_ascii=False),
-                    })
+                    calls.append(
+                        {
+                            "id": "fm-schema-tool-call",
+                            "name": name,
+                            "arguments": json.dumps(arguments, ensure_ascii=False),
+                        }
+                    )
                     content = ""
                 else:
                     content = str(data.get("response", ""))
@@ -343,9 +357,9 @@ class BenchmarkClient:
                 completion_tokens=0,
                 reasoning_tokens=0,
                 latency=latency,
-                schema_transport="fm_schema_tool_emulation" if tool_emulation else (
-                    "fm_schema" if schema else "none"
-                ),
+                schema_transport="fm_schema_tool_emulation"
+                if tool_emulation
+                else ("fm_schema" if schema else "none"),
                 schema_note="fm respond does not expose token usage or native function calls",
             )
         finally:
@@ -368,8 +382,7 @@ class BenchmarkClient:
             schema_transport = "prompt"
             transcript += (
                 "\n\nReturn one JSON object matching this JSON Schema exactly. "
-                "Do not use a code fence.\n"
-                + json.dumps(case.response_schema, ensure_ascii=False)
+                "Do not use a code fence.\n" + json.dumps(case.response_schema, ensure_ascii=False)
             )
         root = self.base_url.removesuffix("/v1").rstrip("/")
         payload = {
@@ -437,7 +450,9 @@ def _score_groups(text: str, groups: list[list[str]], notes: list[str]) -> tuple
     return earned, len(groups)
 
 
-def _score_forbidden(text: str, forbidden: list[str] | list[list[str]], notes: list[str]) -> tuple[int, int]:
+def _score_forbidden(
+    text: str, forbidden: list[str] | list[list[str]], notes: list[str]
+) -> tuple[int, int]:
     if not forbidden:
         return 0, 0
     hits = []
@@ -520,7 +535,9 @@ def score_tool(case: BenchmarkCase, reply: ModelReply) -> Score:
         notes.append(f"tool:{name}!=expected:{expected['tool']}")
     target = str(arguments.get(expected.get("arg", ""), ""))
     group_score, group_total = _score_groups(target, expected.get("anchors", []), notes)
-    forbidden_score, forbidden_total = _score_forbidden(target, expected.get("forbidden", []), notes)
+    forbidden_score, forbidden_total = _score_forbidden(
+        target, expected.get("forbidden", []), notes
+    )
     earned += group_score + forbidden_score
     possible += group_total + forbidden_total
     for key, allowed in expected.get("argument_allowed", {}).items():
@@ -545,12 +562,10 @@ def score_extraction(case: BenchmarkCase, reply: ModelReply) -> Score:
         return Score(False, 0, possible, ["facts_not_array"])
     fact_text = "\n".join(
         f"{fact.get('claim', '')} {fact.get('evidence', '')} {fact.get('published_at', '')}"
-        for fact in facts if isinstance(fact, dict)
+        for fact in facts
+        if isinstance(fact, dict)
     )
-    claim_text = "\n".join(
-        str(fact.get("claim", ""))
-        for fact in facts if isinstance(fact, dict)
-    )
+    claim_text = "\n".join(str(fact.get("claim", "")) for fact in facts if isinstance(fact, dict))
     earned = 0
     if data.get("insufficient_information") is expected["insufficient"]:
         earned += 1
@@ -628,18 +643,26 @@ def score_recovery(case: BenchmarkCase, reply: ModelReply) -> Score:
     expected = case.expected
     if expected["tool"] is None:
         pseudo = BenchmarkCase(
-            id=case.id, suite=case.suite, messages=case.messages,
+            id=case.id,
+            suite=case.suite,
+            messages=case.messages,
             expected={"tool": None, "forbidden": []},
         )
         tool_score = score_tool(pseudo, reply)
         text_case = BenchmarkCase(
-            id=case.id, suite=case.suite, messages=case.messages,
+            id=case.id,
+            suite=case.suite,
+            messages=case.messages,
             expected={"required": expected["required"]},
         )
         text_score = score_text(text_case, reply)
         notes = tool_score.notes + text_score.notes
-        return Score(not notes, tool_score.earned + text_score.earned,
-                     tool_score.possible + text_score.possible, notes)
+        return Score(
+            not notes,
+            tool_score.earned + text_score.earned,
+            tool_score.possible + text_score.possible,
+            notes,
+        )
     notes: list[str] = []
     name, arguments, parse_notes = _decoded_tool(reply)
     notes.extend(parse_notes)
@@ -663,7 +686,9 @@ def score_recovery(case: BenchmarkCase, reply: ModelReply) -> Score:
             earned += 1
         else:
             notes.append("identical_retry")
-    forbidden_score, forbidden_total = _score_forbidden(target, expected.get("forbidden", []), notes)
+    forbidden_score, forbidden_total = _score_forbidden(
+        target, expected.get("forbidden", []), notes
+    )
     earned += forbidden_score
     possible += forbidden_total
     return Score(not notes, earned, possible, notes)
@@ -707,7 +732,8 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
             "pass_rate": round(sum(bool(item["passed"]) for item in valid) / max(1, len(items)), 4),
             "score": round(
                 sum(item["earned"] for item in valid)
-                / max(1, sum(item["possible"] for item in valid)), 4
+                / max(1, sum(item["possible"] for item in valid)),
+                4,
             ),
             "p50_latency": round(statistics.median(latencies), 3) if latencies else 0,
             "p95_latency": round(_percentile(latencies, 0.95), 3),
@@ -735,7 +761,8 @@ def summarize(rows: list[dict[str, Any]]) -> dict[str, Any]:
         "errors": len(rows) - len(valid_rows),
         "score": round(
             sum(row["earned"] for row in valid_rows)
-            / max(1, sum(row["possible"] for row in valid_rows)), 4
+            / max(1, sum(row["possible"] for row in valid_rows)),
+            4,
         ),
         "agent_ready": all(gates.values()) and len(valid_rows) == len(rows),
         "quality_gates": gates,
@@ -785,7 +812,9 @@ def _stop_managed_fm_server(process: subprocess.Popen[str] | None) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Evaluate any OpenAI-compatible model for this agent.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate any OpenAI-compatible model for this agent."
+    )
     parser.add_argument("--base-url", default=os.getenv("LLM_BASE_URL", "http://127.0.0.1:1976/v1"))
     parser.add_argument("--api-key", default=os.getenv("LLM_API_KEY", "local"))
     parser.add_argument("--model", default=os.getenv("LOCAL_MODEL", "system"))
@@ -795,7 +824,9 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Start a fresh fm serve process for every case and stop it afterwards.",
     )
-    parser.add_argument("--suite", action="append", choices=sorted(VALID_SUITES), help="Repeat to select suites.")
+    parser.add_argument(
+        "--suite", action="append", choices=sorted(VALID_SUITES), help="Repeat to select suites."
+    )
     parser.add_argument("--structured-mode", choices=["auto", "native", "prompt"], default="auto")
     parser.add_argument("--schema-dialect", choices=["auto", "standard", "afm"], default="auto")
     parser.add_argument("--temperature", type=float, default=0.0)
@@ -805,7 +836,9 @@ def parse_args() -> argparse.Namespace:
         help="Append text to the system instruction of every benchmark case.",
     )
     parser.add_argument("--timeout", type=float, default=120.0)
-    parser.add_argument("--max-tokens", type=int, default=None, help="Override every case output budget.")
+    parser.add_argument(
+        "--max-tokens", type=int, default=None, help="Override every case output budget."
+    )
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--limit-per-suite", type=int, default=None)
     parser.add_argument("--output", type=Path, default=None)
@@ -828,7 +861,7 @@ def main() -> int:
 
     output = args.output
     if output is None:
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
         output = Path("benchmark-results") / f"{_safe_model_name(args.model)}_{stamp}.jsonl"
     output.parent.mkdir(parents=True, exist_ok=True)
 
@@ -907,19 +940,23 @@ def main() -> int:
     summary = summarize(rows)
     summary_path = output.with_suffix(".summary.json")
     summary_path.write_text(
-        json.dumps({
-            "model": args.model,
-            "provider": args.provider,
-            "base_url": args.base_url,
-            "structured_mode": args.structured_mode,
-            "schema_dialect": client.schema_dialect,
-            "temperature": args.temperature,
-            "system_suffix": args.system_suffix,
-            "repeat": args.repeat,
-            "managed_fm_server": args.managed_fm_server,
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            **summary,
-        }, ensure_ascii=False, indent=2),
+        json.dumps(
+            {
+                "model": args.model,
+                "provider": args.provider,
+                "base_url": args.base_url,
+                "structured_mode": args.structured_mode,
+                "schema_dialect": client.schema_dialect,
+                "temperature": args.temperature,
+                "system_suffix": args.system_suffix,
+                "repeat": args.repeat,
+                "managed_fm_server": args.managed_fm_server,
+                "created_at": datetime.now(UTC).isoformat(),
+                **summary,
+            },
+            ensure_ascii=False,
+            indent=2,
+        ),
         encoding="utf-8",
     )
     print(json.dumps(summary, ensure_ascii=False, indent=2))

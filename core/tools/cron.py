@@ -23,23 +23,35 @@ SCHEMA = {
         "parameters": {
             "type": "object",
             "properties": {
-                "action":   {"type": "string", "enum": ["add", "list", "remove"]},
-                "name":     {"type": "string", "description": "Unique task name"},
-                "schedule": {"type": "string", "description": "Cron expression for recurring tasks, e.g. '0 9 * * *'"},
-                "run_at":   {"type": "string", "description": "Absolute datetime for one-time tasks, e.g. '2026-06-27 15:30'"},
-                "run_in":   {"type": "integer", "description": "Seconds from now for one-time tasks, e.g. 10 for 'in 10 seconds'"},
-                "prompt":   {"type": "string", "description": "Task for the agent to execute. Do NOT include curl or Telegram commands — the result will be delivered automatically."}
+                "action": {"type": "string", "enum": ["add", "list", "remove"]},
+                "name": {"type": "string", "description": "Unique task name"},
+                "schedule": {
+                    "type": "string",
+                    "description": "Cron expression for recurring tasks, e.g. '0 9 * * *'",
+                },
+                "run_at": {
+                    "type": "string",
+                    "description": "Absolute datetime for one-time tasks, e.g. '2026-06-27 15:30'",
+                },
+                "run_in": {
+                    "type": "integer",
+                    "description": "Seconds from now for one-time tasks, e.g. 10 for 'in 10 seconds'",
+                },
+                "prompt": {
+                    "type": "string",
+                    "description": "Task for the agent to execute. Do NOT include curl or Telegram commands — the result will be delivered automatically.",
+                },
             },
-            "required": ["action"]
-        }
-    }
+            "required": ["action"],
+        },
+    },
 }
 
 
 def _load() -> list:
     if not os.path.exists(JOBS_FILE):
         return []
-    with open(JOBS_FILE, "r", encoding="utf-8") as f:
+    with open(JOBS_FILE, encoding="utf-8") as f:
         return json.load(f)
 
 
@@ -48,8 +60,14 @@ def _save(jobs: list) -> None:
         json.dump(jobs, f, ensure_ascii=False, indent=2)
 
 
-def execute(action: str, name: str = "", schedule: str = "",
-            run_at: str = "", run_in: int = 0, prompt: str = "") -> str:
+def execute(
+    action: str,
+    name: str = "",
+    schedule: str = "",
+    run_at: str = "",
+    run_in: int = 0,
+    prompt: str = "",
+) -> str:
     with _lock:
         jobs = _load()
 

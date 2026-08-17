@@ -105,12 +105,19 @@ llm-agent/
 
 ## Running
 ```bash
-python main.py --cli
-python main.py --telegram
-python main.py --telegram --local
-python main.py --telegram --server
+uv sync --all-groups
+uv run python main.py --cli
+uv run python main.py --telegram
+uv run python main.py --telegram --local
+uv run python main.py --telegram --server
 ```
 
 - No model flag means hybrid mode.
 - `--local` forbids PCC usage.
 - `--server` uses PCC only.
+
+## Quality checks
+```bash
+uv run ruff check .
+uv run python -m unittest discover -s tests
+```

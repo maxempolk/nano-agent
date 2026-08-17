@@ -1,8 +1,8 @@
 import argparse
-from datetime import datetime
 import os
 import platform
 import sys
+from datetime import datetime
 
 from dotenv import load_dotenv
 from openai import OpenAI
@@ -30,15 +30,18 @@ interface.add_argument("--cli", action="store_true", help="терминальн�
 interface.add_argument("--telegram", action="store_true", help="Telegram-интерфейс")
 model_group = parser.add_mutually_exclusive_group()
 model_group.add_argument(
-    "--model", choices=("hybrid", "auto", "local", "pcc", "server"),
+    "--model",
+    choices=("hybrid", "auto", "local", "pcc", "server"),
     help="маршрутизация Apple-моделей (по умолчанию: hybrid)",
 )
 model_group.add_argument(
-    "--local", action="store_true",
+    "--local",
+    action="store_true",
     help="только локальная AFM Core 3, без PCC",
 )
 model_group.add_argument(
-    "--server", action="store_true",
+    "--server",
+    action="store_true",
     help="только Apple PCC, без локальной модели",
 )
 parser.add_argument(
@@ -77,11 +80,13 @@ def _int_env(primary: str, fallback: str, default: int) -> int:
 
 try:
     LOCAL_TOKEN_BUDGET = _int_env(
-        "LOCAL_CONTEXT_TOKEN_BUDGET", "CONTEXT_TOKEN_BUDGET",
+        "LOCAL_CONTEXT_TOKEN_BUDGET",
+        "CONTEXT_TOKEN_BUDGET",
         DEFAULT_LOCAL_CONTEXT_TOKEN_BUDGET,
     )
     PCC_TOKEN_BUDGET = _int_env(
-        "PCC_CONTEXT_TOKEN_BUDGET", "CONTEXT_TOKEN_BUDGET",
+        "PCC_CONTEXT_TOKEN_BUDGET",
+        "CONTEXT_TOKEN_BUDGET",
         DEFAULT_PCC_CONTEXT_TOKEN_BUDGET,
     )
     COMPACT_RATIO = float(os.environ.get("COMPACT_TRIGGER_RATIO", "0.8"))
@@ -178,11 +183,17 @@ def _router(*, cron: bool = False) -> AppleModelRouter:
     local_system = local_prompts.cron_agent if cron else local_prompts.agent
     pcc_system = pcc_prompts.cron_agent if cron else pcc_prompts.agent
     local = ModelRoute(
-        "local", APPLE_LOCAL_MODEL, local_system, LOCAL_TOKEN_BUDGET,
+        "local",
+        APPLE_LOCAL_MODEL,
+        local_system,
+        LOCAL_TOKEN_BUDGET,
         fallback_model=APPLE_PCC_MODEL if model_mode == "hybrid" else None,
     )
     pcc = ModelRoute(
-        "pcc", APPLE_PCC_MODEL, pcc_system, PCC_TOKEN_BUDGET,
+        "pcc",
+        APPLE_PCC_MODEL,
+        pcc_system,
+        PCC_TOKEN_BUDGET,
         fallback_model=APPLE_LOCAL_MODEL if model_mode == "hybrid" else None,
     )
     return AppleModelRouter(local, pcc, mode=model_mode)
@@ -224,7 +235,9 @@ if TELEGRAM_BOT_TOKEN and ALLOWED_USER_ID:
 
 if mode == "telegram":
     from interfaces.telegram import run
+
     run(agent, TELEGRAM_BOT_TOKEN, ALLOWED_USER_ID, logger=logger)
 else:
     from interfaces.cli import run
+
     run(agent)

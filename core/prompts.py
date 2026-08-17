@@ -96,9 +96,9 @@ PROFILES = {
 }
 
 
-def build_prompt_set(name: str, *, system_info: str,
-                     telegram_token: str = "",
-                     allowed_user_id: str = "") -> PromptSet:
+def build_prompt_set(
+    name: str, *, system_info: str, telegram_token: str = "", allowed_user_id: str = ""
+) -> PromptSet:
     try:
         profile = PROFILES[name]
     except KeyError as e:

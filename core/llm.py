@@ -4,9 +4,15 @@ from openai import OpenAI
 from openai.types.chat import ChatCompletion
 
 
-def _completion(content: str, model: str, *, completion_id: str = "local-response",
-                created: int = 0, finish_reason: str = "stop",
-                tool_calls: list | None = None) -> ChatCompletion:
+def _completion(
+    content: str,
+    model: str,
+    *,
+    completion_id: str = "local-response",
+    created: int = 0,
+    finish_reason: str = "stop",
+    tool_calls: list | None = None,
+) -> ChatCompletion:
     message: dict = {
         "role": "assistant",
         "content": content,
@@ -14,17 +20,21 @@ def _completion(content: str, model: str, *, completion_id: str = "local-respons
     if tool_calls:
         message["tool_calls"] = tool_calls
 
-    return ChatCompletion.model_validate({
-        "id": completion_id,
-        "object": "chat.completion",
-        "created": created,
-        "model": model,
-        "choices": [{
-            "index": 0,
-            "finish_reason": finish_reason,
-            "message": message,
-        }],
-    })
+    return ChatCompletion.model_validate(
+        {
+            "id": completion_id,
+            "object": "chat.completion",
+            "created": created,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "finish_reason": finish_reason,
+                    "message": message,
+                }
+            ],
+        }
+    )
 
 
 def _text_completion(content: str, model: str) -> ChatCompletion:
@@ -81,11 +91,14 @@ def _sse_completion(response: str, model: str) -> ChatCompletion | None:
             if not isinstance(call, dict):
                 continue
             index = call.get("index", len(tool_calls))
-            current = tool_calls.setdefault(index, {
-                "id": "",
-                "type": "function",
-                "function": {"name": "", "arguments": ""},
-            })
+            current = tool_calls.setdefault(
+                index,
+                {
+                    "id": "",
+                    "type": "function",
+                    "function": {"name": "", "arguments": ""},
+                },
+            )
             if call.get("id"):
                 current["id"] = call["id"]
             if call.get("type"):
@@ -141,9 +154,13 @@ def _normalize_completion(response, model: str) -> ChatCompletion:
     raise TypeError(f"Неподдерживаемый формат ответа LLM: {type(response).__name__}")
 
 
-def call_llm(client: OpenAI, model: str, messages: list,
-             tools: list | None = None,
-             response_format: dict | None = None) -> ChatCompletion:
+def call_llm(
+    client: OpenAI,
+    model: str,
+    messages: list,
+    tools: list | None = None,
+    response_format: dict | None = None,
+) -> ChatCompletion:
     kwargs: dict = {"model": model, "messages": messages}
     if tools:
         kwargs["tools"] = tools

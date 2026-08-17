@@ -1,31 +1,31 @@
-from types import SimpleNamespace
 import time
+from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import MagicMock, patch
 
 from core.tools.web_search import (
-    AspectStatus,
+    LLM_INPUT_TOKEN_BUDGET,
+    MAX_FORMATTED_RESULT_CHARS,
+    MAX_RETRIES,
+    PAGE_CONTEXT_CHARS,
     AspectReview,
+    AspectStatus,
     CandidateExtraction,
     ConflictAssessment,
     DeepFact,
     DeepSynthesis,
     ExpectedValue,
-    MAX_FORMATTED_RESULT_CHARS,
-    MAX_RETRIES,
-    LLM_INPUT_TOKEN_BUDGET,
     NormalFact,
     NormalPageEvidence,
-    PAGE_CONTEXT_CHARS,
     PlannedQuery,
+    ResearchAspect,
+    ResearchPlan,
     ResearchResult,
     ResearchSource,
     SearchBudget,
     SearchBudgetExceeded,
     SearchIntent,
     SearchMode,
-    ResearchPlan,
-    ResearchAspect,
     WebSearchTool,
     _afm_generation_schema,
     _estimate_input_tokens,
@@ -40,8 +40,15 @@ def _completion(text: str):
     return SimpleNamespace(choices=[choice])
 
 
-def _planned(query: str, *, search_queries=None, aspects=None,
-             expected=ExpectedValue.FACT, fresh=False, domain=None):
+def _planned(
+    query: str,
+    *,
+    search_queries=None,
+    aspects=None,
+    expected=ExpectedValue.FACT,
+    fresh=False,
+    domain=None,
+):
     queries = search_queries or [query]
     plan = ResearchPlan(
         search_queries=queries,
@@ -171,15 +178,16 @@ class WebSearchStructuredTests(TestCase):
         self.assertIn("end", content)
 
     def test_formatted_result_stays_inside_agent_tool_limit(self):
-        results = [{
-            "title": "Source " + "t" * 300,
-            "href": "https://example.com/" + "u" * 400,
-            "body": "2026",
-        }]
-        synthesis = DeepSynthesis(facts=[
-            DeepFact(claim="fact " + "x" * 500, source_ids=[1])
-            for _ in range(8)
-        ])
+        results = [
+            {
+                "title": "Source " + "t" * 300,
+                "href": "https://example.com/" + "u" * 400,
+                "body": "2026",
+            }
+        ]
+        synthesis = DeepSynthesis(
+            facts=[DeepFact(claim="fact " + "x" * 500, source_ids=[1]) for _ in range(8)]
+        )
 
         result = self.tool._format_deep_results(results, synthesis)
 
@@ -190,12 +198,14 @@ class WebSearchStructuredTests(TestCase):
         result = ResearchResult(
             query="исследуй уровень жизни",
             mode="deep",
-            sources=[ResearchSource(
-                source_id=1,
-                title="Official statistics",
-                url="https://example.test/statistics",
-                official=True,
-            )],
+            sources=[
+                ResearchSource(
+                    source_id=1,
+                    title="Official statistics",
+                    url="https://example.test/statistics",
+                    official=True,
+                )
+            ],
             facts=[DeepFact(claim="Подтверждённый факт", source_ids=[1])],
             coverage_gaps=["безопасность"],
         )
@@ -216,10 +226,12 @@ class WebSearchStructuredTests(TestCase):
             insufficient_information=False,
         )
 
-        with patch.object(self.tool, "_search", return_value=results), \
-             patch.object(self.tool, "_plan_research", return_value=_planned("question")), \
-             patch.object(self.tool, "_scrape", return_value="page text"), \
-             patch.object(self.tool, "_extract_normal_page", return_value=page) as extract:
+        with (
+            patch.object(self.tool, "_search", return_value=results),
+            patch.object(self.tool, "_plan_research", return_value=_planned("question")),
+            patch.object(self.tool, "_scrape", return_value="page text"),
+            patch.object(self.tool, "_extract_normal_page", return_value=page) as extract,
+        ):
             result = self.tool.execute("question", depth="normal")
 
         self.assertEqual(extract.call_count, 2)
@@ -256,9 +268,11 @@ class WebSearchStructuredTests(TestCase):
         ]
         self.tool.logger = MagicMock()
 
-        with patch.object(self.tool, "_search", return_value=results), \
-             patch.object(self.tool, "_scrape") as scrape, \
-             patch("core.tools.web_search.call_llm") as llm:
+        with (
+            patch.object(self.tool, "_search", return_value=results),
+            patch.object(self.tool, "_scrape") as scrape,
+            patch("core.tools.web_search.call_llm") as llm,
+        ):
             result = self.tool.execute("Какая последняя версия GPT?")
 
         llm.assert_not_called()
@@ -271,15 +285,19 @@ class WebSearchStructuredTests(TestCase):
         self.assertIn("llm_calls=0/0", logged)
 
     def test_low_quality_numeric_quick_stays_quick_without_escalation(self):
-        results = [{
-            "title": "Administrative divisions - Statistics Norway",
-            "href": "https://www.ssb.no/en/regions",
-            "body": "Updated in 2026. Information about Norway municipalities.",
-        }]
+        results = [
+            {
+                "title": "Administrative divisions - Statistics Norway",
+                "href": "https://www.ssb.no/en/regions",
+                "body": "Updated in 2026. Information about Norway municipalities.",
+            }
+        ]
 
-        with patch.object(self.tool, "_search", return_value=results), \
-             patch.object(self.tool, "_scrape") as scrape, \
-             patch.object(self.tool, "_extract_normal_page") as extract:
+        with (
+            patch.object(self.tool, "_search", return_value=results),
+            patch.object(self.tool, "_scrape") as scrape,
+            patch.object(self.tool, "_extract_normal_page") as extract,
+        ):
             result = self.tool.execute("сколько коммун в Норвегии?", depth="auto")
 
         scrape.assert_not_called()
@@ -300,28 +318,36 @@ class WebSearchStructuredTests(TestCase):
     def test_number_near_subject_satisfies_requested_count(self):
         intent = self.tool._analyze_intent("сколько коммун в Норвегии?")
 
-        self.assertTrue(self.tool._contains_expected_value(
-            intent,
-            "Норвегия насчитывает 357 коммун.",
-        ))
+        self.assertTrue(
+            self.tool._contains_expected_value(
+                intent,
+                "Норвегия насчитывает 357 коммун.",
+            )
+        )
 
     def test_related_category_count_is_not_mistaken_for_subject_count(self):
         intent = self.tool._analyze_intent("сколько коммун в Норвегии?")
 
-        self.assertFalse(self.tool._contains_expected_value(
-            intent,
-            "Statistics Norway classified municipalities into 17 categories.",
-        ))
+        self.assertFalse(
+            self.tool._contains_expected_value(
+                intent,
+                "Statistics Norway classified municipalities into 17 categories.",
+            )
+        )
 
     def test_explicit_quick_never_escalates(self):
-        results = [{
-            "title": "Administrative divisions - Statistics Norway",
-            "href": "https://www.ssb.no/en/regions",
-            "body": "Updated in 2026. Information about Norway municipalities.",
-        }]
+        results = [
+            {
+                "title": "Administrative divisions - Statistics Norway",
+                "href": "https://www.ssb.no/en/regions",
+                "body": "Updated in 2026. Information about Norway municipalities.",
+            }
+        ]
 
-        with patch.object(self.tool, "_search", return_value=results), \
-             patch.object(self.tool, "_scrape") as scrape:
+        with (
+            patch.object(self.tool, "_search", return_value=results),
+            patch.object(self.tool, "_scrape") as scrape,
+        ):
             result = self.tool.execute("сколько коммун в Норвегии?", depth="quick")
 
         scrape.assert_not_called()
@@ -392,21 +418,36 @@ class WebSearchStructuredTests(TestCase):
             domain="ssb.no",
         )
 
-        self.assertFalse(self.tool._fact_matches_intent(intent, NormalFact(
-            claim="Municipalities are classified into 17 categories",
-            evidence="Statistics Norway classified municipalities into 17 categories.",
-            published_at="2026-01-01",
-        )))
-        self.assertFalse(self.tool._fact_matches_intent(intent, NormalFact(
-            claim="Norway has 356 municipalities",
-            evidence="Norway has 356 municipalities.",
-            published_at="2020-01-01",
-        )))
-        self.assertTrue(self.tool._fact_matches_intent(intent, NormalFact(
-            claim="Norway has 357 municipalities",
-            evidence="Norway currently has 357 municipalities.",
-            published_at="2026-01-01",
-        )))
+        self.assertFalse(
+            self.tool._fact_matches_intent(
+                intent,
+                NormalFact(
+                    claim="Municipalities are classified into 17 categories",
+                    evidence="Statistics Norway classified municipalities into 17 categories.",
+                    published_at="2026-01-01",
+                ),
+            )
+        )
+        self.assertFalse(
+            self.tool._fact_matches_intent(
+                intent,
+                NormalFact(
+                    claim="Norway has 356 municipalities",
+                    evidence="Norway has 356 municipalities.",
+                    published_at="2020-01-01",
+                ),
+            )
+        )
+        self.assertTrue(
+            self.tool._fact_matches_intent(
+                intent,
+                NormalFact(
+                    claim="Norway has 357 municipalities",
+                    evidence="Norway currently has 357 municipalities.",
+                    published_at="2026-01-01",
+                ),
+            )
+        )
 
     def test_source_year_uses_most_recent_year_in_result_metadata(self):
         result = {
@@ -472,20 +513,13 @@ class WebSearchStructuredTests(TestCase):
         self.assertEqual(llm.call_args.args[1], "system")
 
     def test_planner_cannot_label_commercial_domain_as_official(self):
-        intent = SearchIntent(
-            original_query="Norway cost of living",
-            normalized_query="Norway cost of living",
-            expected_value=ExpectedValue.FACT,
-            requires_freshness=True,
-            official_requested=False,
-            official_domain="numbeo.com",
-            preferred_domains=("numbeo.com",),
-        )
-        results = [{
-            "title": "Cost of Living",
-            "href": "https://www.numbeo.com/cost-of-living/country_result.jsp?country=Norway",
-            "body": "Current prices in Norway",
-        }]
+        results = [
+            {
+                "title": "Cost of Living",
+                "href": "https://www.numbeo.com/cost-of-living/country_result.jsp?country=Norway",
+                "body": "Current prices in Norway",
+            }
+        ]
 
         rendered = self.tool._format_normal_results(
             results,
@@ -523,10 +557,12 @@ class WebSearchStructuredTests(TestCase):
         self.assertEqual(llm.call_args_list[1].args[1], "system")
 
     def test_empty_pcc_verification_does_not_promote_afm_candidates(self):
-        pages = [NormalPageEvidence(
-            facts=[NormalFact(claim="Supported fact", evidence="source text")],
-            insufficient_information=False,
-        )]
+        pages = [
+            NormalPageEvidence(
+                facts=[NormalFact(claim="Supported fact", evidence="source text")],
+                insufficient_information=False,
+            )
+        ]
 
         with patch.object(self.tool, "_structured", return_value=DeepSynthesis()):
             synthesis = self.tool._synthesize_deep("question", pages)
@@ -545,19 +581,21 @@ class WebSearchStructuredTests(TestCase):
         self.assertNotIn("acceptance_criteria", encoded)
 
     def test_page_extraction_produces_unverified_candidates_only(self):
-        candidates = CandidateExtraction(facts=[{
-            "claim": "The measured value was 10",
-            "evidence": "The measured value was 10",
-            "published_at": "2026",
-        }])
+        candidates = CandidateExtraction(
+            facts=[
+                {
+                    "claim": "The measured value was 10",
+                    "evidence": "The measured value was 10",
+                    "published_at": "2026",
+                }
+            ]
+        )
         result = {
             "title": "Measurement",
             "href": "https://example.test/value",
             "body": "",
         }
-        with patch.object(
-            self.tool, "_structured", return_value=candidates
-        ) as structured:
+        with patch.object(self.tool, "_structured", return_value=candidates) as structured:
             page = self.tool._extract_normal_page(
                 "What was the measured value?",
                 result,
@@ -575,25 +613,37 @@ class WebSearchStructuredTests(TestCase):
             query="income",
             requirement="median household income",
         )
-        pages = [NormalPageEvidence(
-            facts=[NormalFact(
-                claim="Median income was 10",
-                evidence="Median income was 10",
-            )],
-            insufficient_information=False,
-            aspect_name="income",
-        )]
-        unreviewed = DeepSynthesis(facts=[DeepFact(
-            claim="Median income was 10",
-            source_ids=[1],
-        )])
-        reviewed = unreviewed.model_copy(update={
-            "aspect_reviews": [AspectReview(
-                name="income",
-                status="confirmed",
-                source_ids=[1],
-            )]
-        })
+        pages = [
+            NormalPageEvidence(
+                facts=[
+                    NormalFact(
+                        claim="Median income was 10",
+                        evidence="Median income was 10",
+                    )
+                ],
+                insufficient_information=False,
+                aspect_name="income",
+            )
+        ]
+        unreviewed = DeepSynthesis(
+            facts=[
+                DeepFact(
+                    claim="Median income was 10",
+                    source_ids=[1],
+                )
+            ]
+        )
+        reviewed = unreviewed.model_copy(
+            update={
+                "aspect_reviews": [
+                    AspectReview(
+                        name="income",
+                        status="confirmed",
+                        source_ids=[1],
+                    )
+                ]
+            }
+        )
 
         self.assertEqual(
             self.tool._reviewed_aspect_outcomes([aspect], pages, unreviewed)[0].status,
@@ -614,22 +664,42 @@ class WebSearchStructuredTests(TestCase):
             official_domain=None,
         )
 
-        self.assertFalse(self.tool._fact_matches_intent(intent, NormalFact(
-            claim="Five hospital projects receive new loans",
-            evidence="The budget authorises hospital construction in 2026.",
-        )))
-        self.assertFalse(self.tool._fact_matches_intent(intent, NormalFact(
-            claim="Norway ranked among the happiest countries in 2019",
-            evidence="The 2019 report measured life satisfaction.",
-        )))
-        self.assertTrue(self.tool._fact_matches_intent(intent, NormalFact(
-            claim="Household income increased in 2026",
-            evidence="Income statistics were updated in 2026.",
-        )))
-        self.assertTrue(self.tool._fact_matches_intent(intent, NormalFact(
-            claim="Housing costs averaged 132,263 NOK in 2023",
-            evidence="Housing statistics reported the 2023 average.",
-        )))
+        self.assertFalse(
+            self.tool._fact_matches_intent(
+                intent,
+                NormalFact(
+                    claim="Five hospital projects receive new loans",
+                    evidence="The budget authorises hospital construction in 2026.",
+                ),
+            )
+        )
+        self.assertFalse(
+            self.tool._fact_matches_intent(
+                intent,
+                NormalFact(
+                    claim="Norway ranked among the happiest countries in 2019",
+                    evidence="The 2019 report measured life satisfaction.",
+                ),
+            )
+        )
+        self.assertTrue(
+            self.tool._fact_matches_intent(
+                intent,
+                NormalFact(
+                    claim="Household income increased in 2026",
+                    evidence="Income statistics were updated in 2026.",
+                ),
+            )
+        )
+        self.assertTrue(
+            self.tool._fact_matches_intent(
+                intent,
+                NormalFact(
+                    claim="Housing costs averaged 132,263 NOK in 2023",
+                    evidence="Housing statistics reported the 2023 average.",
+                ),
+            )
+        )
 
     def test_external_fact_must_match_planned_subject(self):
         intent = SearchIntent(
@@ -643,22 +713,26 @@ class WebSearchStructuredTests(TestCase):
             subject="Norway",
         )
 
-        self.assertFalse(self.tool._fact_matches_intent(
-            intent,
-            NormalFact(
-                claim="Sweden ranks first for quality of life in 2026",
-                evidence="Sweden leads the quality of life ranking.",
-            ),
-            "https://example.org/ranking",
-        ))
-        self.assertTrue(self.tool._fact_matches_intent(
-            intent,
-            NormalFact(
-                claim="Life satisfaction averaged 7.0 in 2025",
-                evidence="The official survey reports life satisfaction of 7.0.",
-            ),
-            "https://www.ssb.no/survey",
-        ))
+        self.assertFalse(
+            self.tool._fact_matches_intent(
+                intent,
+                NormalFact(
+                    claim="Sweden ranks first for quality of life in 2026",
+                    evidence="Sweden leads the quality of life ranking.",
+                ),
+                "https://example.org/ranking",
+            )
+        )
+        self.assertTrue(
+            self.tool._fact_matches_intent(
+                intent,
+                NormalFact(
+                    claim="Life satisfaction averaged 7.0 in 2025",
+                    evidence="The official survey reports life satisfaction of 7.0.",
+                ),
+                "https://www.ssb.no/survey",
+            )
+        )
 
     def test_fact_filter_rejects_absence_statements(self):
         intent = SearchIntent(
@@ -670,17 +744,21 @@ class WebSearchStructuredTests(TestCase):
             official_domain=None,
         )
 
-        self.assertFalse(self.tool._fact_matches_intent(
-            intent,
-            NormalFact(
-                claim="Information about incomes is absent.",
-                evidence="The page does not provide relevant information.",
-            ),
-        ))
+        self.assertFalse(
+            self.tool._fact_matches_intent(
+                intent,
+                NormalFact(
+                    claim="Information about incomes is absent.",
+                    evidence="The page does not provide relevant information.",
+                ),
+            )
+        )
 
     def test_pdf_scraper_uses_pdftotext_path_before_html_extractors(self):
-        with patch.object(self.tool, "_scrape_pdf", return_value="x" * 300) as pdf, \
-             patch.object(self.tool, "_scrape_crawl4ai") as html:
+        with (
+            patch.object(self.tool, "_scrape_pdf", return_value="x" * 300) as pdf,
+            patch.object(self.tool, "_scrape_crawl4ai") as html,
+        ):
             content = self.tool._scrape("https://example.test/report.pdf")
 
         self.assertEqual(content, "x" * 300)
@@ -751,10 +829,14 @@ class WebSearchStructuredTests(TestCase):
             official_domain=None,
             subject="Norway",
         )
-        self.tool.last_plan = ResearchPlan(queries=[PlannedQuery(
-            query="Norway life satisfaction",
-            aspect="life satisfaction",
-        )])
+        self.tool.last_plan = ResearchPlan(
+            queries=[
+                PlannedQuery(
+                    query="Norway life satisfaction",
+                    aspect="life satisfaction",
+                )
+            ]
+        )
         results = [
             {
                 "title": "Life Satisfaction Survey Template",
@@ -770,9 +852,7 @@ class WebSearchStructuredTests(TestCase):
             },
         ]
 
-        selected = self.tool._select_deep_sources(
-            intent, results, ["life satisfaction"]
-        )
+        selected = self.tool._select_deep_sources(intent, results, ["life satisfaction"])
 
         self.assertEqual(selected[0]["href"], "https://www.ssb.no/en/life-satisfaction")
         self.assertFalse(any("jotform.com" in item["href"] for item in selected))
@@ -803,9 +883,7 @@ class WebSearchStructuredTests(TestCase):
         self.tool.last_intent = intent
 
         with patch.object(self.tool, "_scrape", return_value="x" * 300):
-            self.tool._replace_unreadable_sources(
-                selected, [broken, replacement], scraped
-            )
+            self.tool._replace_unreadable_sources(selected, [broken, replacement], scraped)
 
         self.assertEqual(selected[0], replacement)
         self.assertEqual(scraped[replacement["href"]], "x" * 300)
@@ -826,17 +904,19 @@ class WebSearchStructuredTests(TestCase):
         selected = [broken]
         pages = [NormalPageEvidence(facts=[], insufficient_information=True)]
         replacement_page = NormalPageEvidence(
-            facts=[NormalFact(
-                claim="Crime declined",
-                evidence="Official statistics",
-            )],
+            facts=[
+                NormalFact(
+                    claim="Crime declined",
+                    evidence="Official statistics",
+                )
+            ],
             insufficient_information=False,
         )
 
-        with patch.object(self.tool, "_scrape", return_value="x" * 300), \
-             patch.object(
-                 self.tool, "_extract_normal_page", return_value=replacement_page
-             ):
+        with (
+            patch.object(self.tool, "_scrape", return_value="x" * 300),
+            patch.object(self.tool, "_extract_normal_page", return_value=replacement_page),
+        ):
             self.tool._replace_empty_extractions(
                 "Norway safety", selected, [broken, replacement], {}, pages
             )
@@ -845,13 +925,17 @@ class WebSearchStructuredTests(TestCase):
         self.assertEqual(pages[0], replacement_page)
 
     def test_deep_reports_requested_aspects_missing_from_evidence(self):
-        pages = [NormalPageEvidence(
-            facts=[NormalFact(
-                claim="Household income increased in 2026",
-                evidence="Income statistics rose.",
-            )],
-            insufficient_information=False,
-        )]
+        pages = [
+            NormalPageEvidence(
+                facts=[
+                    NormalFact(
+                        claim="Household income increased in 2026",
+                        evidence="Income statistics rose.",
+                    )
+                ],
+                insufficient_information=False,
+            )
+        ]
 
         gaps = self.tool._coverage_gaps(["income", "public safety"], pages)
         rendered = self.tool._format_deep_results([], DeepSynthesis(), gaps)
@@ -873,8 +957,18 @@ class WebSearchStructuredTests(TestCase):
             {"title": "Income", "href": "https://a.test", "body": "income", "_plan_query": 0},
             {"title": "Housing", "href": "https://b.test", "body": "housing", "_plan_query": 1},
             {"title": "Safety", "href": "https://c.test", "body": "safety", "_plan_query": 2},
-            {"title": "Satisfaction one", "href": "https://d.test", "body": "satisfaction", "_plan_query": 3},
-            {"title": "Satisfaction two", "href": "https://e.test", "body": "satisfaction", "_plan_query": 3},
+            {
+                "title": "Satisfaction one",
+                "href": "https://d.test",
+                "body": "satisfaction",
+                "_plan_query": 3,
+            },
+            {
+                "title": "Satisfaction two",
+                "href": "https://e.test",
+                "body": "satisfaction",
+                "_plan_query": 3,
+            },
         ]
 
         selected = self.tool._select_deep_sources(
@@ -938,20 +1032,22 @@ class WebSearchStructuredTests(TestCase):
             insufficient_information=False,
         )
 
-        with patch.object(self.tool, "_search", return_value=results) as search, \
-             patch.object(
-                 self.tool,
-                 "_plan_research",
-                 return_value=_planned(
-                     "проверь последнюю версию GPT",
-                     search_queries=["latest GPT model OpenAI"],
-                     expected=ExpectedValue.VERSION,
-                     fresh=True,
-                     domain="openai.com",
-                 ),
-             ), \
-             patch.object(self.tool, "_scrape", return_value="short page"), \
-             patch.object(self.tool, "_extract_normal_page", return_value=evidence):
+        with (
+            patch.object(self.tool, "_search", return_value=results) as search,
+            patch.object(
+                self.tool,
+                "_plan_research",
+                return_value=_planned(
+                    "проверь последнюю версию GPT",
+                    search_queries=["latest GPT model OpenAI"],
+                    expected=ExpectedValue.VERSION,
+                    fresh=True,
+                    domain="openai.com",
+                ),
+            ),
+            patch.object(self.tool, "_scrape", return_value="short page"),
+            patch.object(self.tool, "_extract_normal_page", return_value=evidence),
+        ):
             self.tool.execute("проверь последнюю версию GPT", depth="normal")
 
         search.assert_called_once_with("latest GPT model OpenAI")
@@ -973,15 +1069,17 @@ class WebSearchStructuredTests(TestCase):
             facts=[DeepFact(claim="verified", source_ids=[1, 2])],
         )
 
-        with patch.object(self.tool, "_search", return_value=results) as search, \
-             patch.object(
-                 self.tool,
-                 "_plan_research",
-                 return_value=_planned("подробно исследуй тему"),
-             ), \
-             patch.object(self.tool, "_scrape", return_value="page"), \
-             patch.object(self.tool, "_extract_normal_page", return_value=page) as extract, \
-             patch.object(self.tool, "_synthesize_deep", return_value=synthesis) as synthesize:
+        with (
+            patch.object(self.tool, "_search", return_value=results) as search,
+            patch.object(
+                self.tool,
+                "_plan_research",
+                return_value=_planned("подробно исследуй тему"),
+            ),
+            patch.object(self.tool, "_scrape", return_value="page"),
+            patch.object(self.tool, "_extract_normal_page", return_value=page) as extract,
+            patch.object(self.tool, "_synthesize_deep", return_value=synthesis) as synthesize,
+        ):
             result = self.tool.execute("подробно исследуй тему", depth="deep")
 
         search.assert_called_once_with("подробно исследуй тему")
@@ -1016,15 +1114,17 @@ class WebSearchStructuredTests(TestCase):
             captured_pages.extend(pages)
             return DeepSynthesis()
 
-        with patch.object(self.tool, "_search", return_value=results), \
-             patch.object(
-                 self.tool,
-                 "_plan_research",
-                 return_value=_planned("подробно исследуй тему"),
-             ), \
-             patch.object(self.tool, "_scrape", return_value="page"), \
-             patch.object(self.tool, "_extract_normal_page", side_effect=extract), \
-             patch.object(self.tool, "_synthesize_deep", side_effect=synthesize):
+        with (
+            patch.object(self.tool, "_search", return_value=results),
+            patch.object(
+                self.tool,
+                "_plan_research",
+                return_value=_planned("подробно исследуй тему"),
+            ),
+            patch.object(self.tool, "_scrape", return_value="page"),
+            patch.object(self.tool, "_extract_normal_page", side_effect=extract),
+            patch.object(self.tool, "_synthesize_deep", side_effect=synthesize),
+        ):
             self.tool.execute("подробно исследуй тему", depth="deep")
 
         self.assertEqual(
@@ -1042,14 +1142,16 @@ class WebSearchStructuredTests(TestCase):
             insufficient_information=False,
         )
 
-        with patch.object(self.tool, "_search", return_value=results), \
-             patch.object(
-                 self.tool,
-                 "_plan_research",
-                 return_value=_planned("verify this"),
-             ), \
-             patch.object(self.tool, "_scrape", return_value="short page"), \
-             patch.object(self.tool, "_structured", return_value=evidence) as structured:
+        with (
+            patch.object(self.tool, "_search", return_value=results),
+            patch.object(
+                self.tool,
+                "_plan_research",
+                return_value=_planned("verify this"),
+            ),
+            patch.object(self.tool, "_scrape", return_value="short page"),
+            patch.object(self.tool, "_structured", return_value=evidence) as structured,
+        ):
             self.tool.execute("verify this", depth="normal")
 
         self.assertEqual(structured.call_count, 2)
@@ -1216,19 +1318,21 @@ class WebSearchStructuredTests(TestCase):
         self.assertEqual(mocked.call_count, 2)
 
     def test_extraction_uses_max_retries(self):
-        candidates = CandidateExtraction(facts=[{
-            "claim": "fact",
-            "evidence": "evidence",
-            "published_at": "",
-        }])
+        candidates = CandidateExtraction(
+            facts=[
+                {
+                    "claim": "fact",
+                    "evidence": "evidence",
+                    "published_at": "",
+                }
+            ]
+        )
         result = {
             "title": "Test",
             "href": "https://example.test/page",
             "body": "",
         }
-        with patch.object(
-            self.tool, "_structured", return_value=candidates
-        ) as structured:
+        with patch.object(self.tool, "_structured", return_value=candidates) as structured:
             self.tool._extract_normal_page("question", result, "page text")
 
         self.assertEqual(structured.call_args.kwargs.get("max_attempts"), MAX_RETRIES)
