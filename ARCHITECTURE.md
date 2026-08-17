@@ -237,12 +237,9 @@ SESSION  2026-07-21 14:30:00
 ```python
 SCHEMA = {
     "type": "function",
-    "function": {
-        "name": "my_tool",
-        "description": "...",
-        "parameters": {...}
-    }
+    "function": {"name": "my_tool", "description": "...", "parameters": {...}},
 }
+
 
 def execute(param1: str, param2: int = 0) -> str:
     return "result"
@@ -251,6 +248,7 @@ def execute(param1: str, param2: int = 0) -> str:
 2. Добавить в `main.py`:
 ```python
 from core.tools import my_tool
+
 agent = _make_agent(logger, extra_tools=[web_search, cron_wrapper, my_tool])
 ```
 
@@ -259,6 +257,7 @@ agent = _make_agent(logger, extra_tools=[web_search, cron_wrapper, my_tool])
 Создать модуль с функцией `run(agent)`:
 ```python
 from core.agent import Agent
+
 
 def run(agent: Agent) -> None:
     while True:

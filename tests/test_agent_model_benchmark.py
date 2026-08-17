@@ -1,6 +1,6 @@
 from unittest import TestCase
 
-from benchmarks.agent_cases import ALL_CASES, BenchmarkCase, EXTRACTION_SCHEMA
+from benchmarks.agent_cases import ALL_CASES, EXTRACTION_SCHEMA
 from benchmarks.agent_model_eval import (
     BenchmarkClient,
     ModelReply,
@@ -35,14 +35,17 @@ class AgentModelBenchmarkTests(TestCase):
         self.assertGreaterEqual(len(ALL_CASES), 40)
 
     def test_json_parser_accepts_fenced_object(self):
-        self.assertEqual(_json_object("```json\n{\"x\": 1}\n```"), {"x": 1})
+        self.assertEqual(_json_object('```json\n{"x": 1}\n```'), {"x": 1})
 
     def test_routing_scores_action_depth_and_query_semantics(self):
         case = next(item for item in ALL_CASES if item.id == "route_current_price")
-        score = score_case(case, reply(
-            '{"action":"web_search","depth":"quick",'
-            '"query":"current Bitcoin BTC price in USD dollars","command":""}'
-        ))
+        score = score_case(
+            case,
+            reply(
+                '{"action":"web_search","depth":"quick",'
+                '"query":"current Bitcoin BTC price in USD dollars","command":""}'
+            ),
+        )
         self.assertTrue(score.passed, score.notes)
 
     def test_tool_case_requires_real_tool_call(self):
@@ -90,19 +93,43 @@ class AgentModelBenchmarkTests(TestCase):
 
     def test_recovery_requires_changed_arguments(self):
         case = next(item for item in ALL_CASES if item.id == "recover_refine_query")
-        repeated = [{"id": "x", "name": "web_search", "arguments": '{"query":"Nimbus 7","depth":"quick"}'}]
-        corrected = [{"id": "x", "name": "web_search", "arguments": '{"query":"Nimbus 7 official release notes","depth":"quick"}'}]
+        repeated = [
+            {"id": "x", "name": "web_search", "arguments": '{"query":"Nimbus 7","depth":"quick"}'}
+        ]
+        corrected = [
+            {
+                "id": "x",
+                "name": "web_search",
+                "arguments": '{"query":"Nimbus 7 official release notes","depth":"quick"}',
+            }
+        ]
         self.assertFalse(score_case(case, reply(tool_calls=repeated)).passed)
         self.assertTrue(score_case(case, reply(tool_calls=corrected)).passed)
 
     def test_summary_reports_suite_rates_and_schema_transport(self):
         rows = [
-            {"suite": "routing", "passed": True, "earned": 3, "possible": 3,
-             "latency": 1.0, "completion_tokens": 10, "reasoning_tokens": 2,
-             "schema_transport": "native", "error": ""},
-            {"suite": "routing", "passed": False, "earned": 1, "possible": 3,
-             "latency": 3.0, "completion_tokens": 20, "reasoning_tokens": 4,
-             "schema_transport": "prompt", "error": ""},
+            {
+                "suite": "routing",
+                "passed": True,
+                "earned": 3,
+                "possible": 3,
+                "latency": 1.0,
+                "completion_tokens": 10,
+                "reasoning_tokens": 2,
+                "schema_transport": "native",
+                "error": "",
+            },
+            {
+                "suite": "routing",
+                "passed": False,
+                "earned": 1,
+                "possible": 3,
+                "latency": 3.0,
+                "completion_tokens": 20,
+                "reasoning_tokens": 4,
+                "schema_transport": "prompt",
+                "error": "",
+            },
         ]
         summary = summarize(rows)
         self.assertEqual(summary["passed"], 1)
@@ -113,9 +140,7 @@ class AgentModelBenchmarkTests(TestCase):
 
     def test_extraction_schema_forbids_unexpected_fields(self):
         self.assertFalse(EXTRACTION_SCHEMA["additionalProperties"])
-        self.assertFalse(
-            EXTRACTION_SCHEMA["properties"]["facts"]["items"]["additionalProperties"]
-        )
+        self.assertFalse(EXTRACTION_SCHEMA["properties"]["facts"]["items"]["additionalProperties"])
 
     def test_fm_transcript_preserves_tool_error_for_recovery(self):
         case = next(item for item in ALL_CASES if item.id == "recover_correct_path")

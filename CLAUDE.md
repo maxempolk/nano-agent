@@ -4,6 +4,12 @@
 - Remind the user to commit after every significant feature or fix. Do NOT commit automatically.
 - Wait for the user to explicitly say "сделай коммит" before committing.
 
+## Environment
+
+- Python dependencies are defined in `pyproject.toml` and installed with
+  `uv sync --all-groups`.
+- Run the test suite with `uv run python -m unittest discover -s tests`.
+
 ## Token Economy (top priority)
 - Keep system prompts as short as possible. Every word costs tokens.
 - Skills injected into the system prompt must be dense — no examples, no repeating what the model already knows, no filler.
@@ -35,6 +41,8 @@ python main.py --telegram  # Telegram bot (long polling)
 ```
 
 ## Env vars
-- `API_TOKEN` — Groq API key
+- `LLM_BASE_URL` — OpenAI-compatible local bridge URL
+- `LOCAL_MODEL` / `PCC_MODEL` — local and PCC model aliases
+- `MODEL_MODE` — `hybrid`, `local` or `pcc`
 - `TELEGRAM_BOT_TOKEN` — Telegram bot token (optional; enables Telegram interface + skill)
 - `ALLOWED_USER_ID` — only Telegram user_id allowed to interact with the bot (user_id == chat_id in private chats)

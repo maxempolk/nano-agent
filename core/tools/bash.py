@@ -7,12 +7,10 @@ SCHEMA = {
         "description": "Execute a bash command.",
         "parameters": {
             "type": "object",
-            "properties": {
-                "command": {"type": "string"}
-            },
-            "required": ["command"]
-        }
-    }
+            "properties": {"command": {"type": "string"}},
+            "required": ["command"],
+        },
+    },
 }
 
 

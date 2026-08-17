@@ -63,9 +63,9 @@ class AgentForcedSearchTests(TestCase):
             _validate_final_answer("English answer only", "ответь по-русски")[1],
             "language_mismatch",
         )
-        self.assertTrue(_validate_final_answer(
-            "Краткий вывод: данные подтверждены.", "ответь по-русски"
-        )[0])
+        self.assertTrue(
+            _validate_final_answer("Краткий вывод: данные подтверждены.", "ответь по-русски")[0]
+        )
 
     def test_final_answer_cannot_hide_partial_coverage(self):
         valid, reason = _validate_final_answer(
@@ -75,23 +75,26 @@ class AgentForcedSearchTests(TestCase):
         )
         self.assertFalse(valid)
         self.assertEqual(reason, "partial_coverage_hidden")
-        self.assertTrue(_validate_final_answer(
-            "Исследование частичное: не удалось проверить совместимость.",
-            "сравни варианты",
-            require_partial=True,
-        )[0])
+        self.assertTrue(
+            _validate_final_answer(
+                "Исследование частичное: не удалось проверить совместимость.",
+                "сравни варианты",
+                require_partial=True,
+            )[0]
+        )
 
     def test_json_from_pcc_is_rewritten_by_local_finalizer(self):
         web = FakeWebSearch()
         web.last_result = FakeResearchResult()
-        agent = Agent(
-            None, "pcc", "SYSTEM", extra_tools=[web], model_fallback="system"
-        )
+        agent = Agent(None, "pcc", "SYSTEM", extra_tools=[web], model_fallback="system")
 
-        with patch("core.agent.call_llm", side_effect=[
-            _completion('```json\n{"income":{"details":"fact"}}\n```'),
-            _completion("Краткий вывод: уровень жизни высокий, но данные неполны."),
-        ]) as llm:
+        with patch(
+            "core.agent.call_llm",
+            side_effect=[
+                _completion('```json\n{"income":{"details":"fact"}}\n```'),
+                _completion("Краткий вывод: уровень жизни высокий, но данные неполны."),
+            ],
+        ) as llm:
             reply = agent.run_turn("подробно исследуй уровень жизни")
 
         self.assertTrue(reply.startswith("Краткий вывод"))
@@ -100,19 +103,18 @@ class AgentForcedSearchTests(TestCase):
     def test_invalid_answers_from_both_models_use_structured_renderer(self):
         web = FakeWebSearch()
         web.last_result = FakeResearchResult()
-        agent = Agent(
-            None, "pcc", "SYSTEM", extra_tools=[web], model_fallback="system"
-        )
+        agent = Agent(None, "pcc", "SYSTEM", extra_tools=[web], model_fallback="system")
 
-        with patch("core.agent.call_llm", side_effect=[
-            _completion('{"answer":"x"}'),
-            _completion("English only"),
-        ]):
+        with patch(
+            "core.agent.call_llm",
+            side_effect=[
+                _completion('{"answer":"x"}'),
+                _completion("English only"),
+            ],
+        ):
             reply = agent.run_turn("подробно исследуй уровень жизни")
 
-        self.assertEqual(
-            reply, "По результатам поиска: подтверждённый факт [1]."
-        )
+        self.assertEqual(reply, "По результатам поиска: подтверждённый факт [1].")
 
     def test_detects_current_version_query(self):
         self.assertEqual(
@@ -146,17 +148,11 @@ class AgentForcedSearchTests(TestCase):
         self.assertEqual(agent.last_search_query, "latest GPT version")
         self.assertTrue(any(message.get("role") == "tool" for message in agent.messages))
         self.assertEqual(len(llm.call_args.args), 3)
-        self.assertTrue(
-            llm.call_args.args[2][0]["content"].startswith(
-                "Напиши ответ на вопрос"
-            )
-        )
+        self.assertTrue(llm.call_args.args[2][0]["content"].startswith("Напиши ответ на вопрос"))
 
     def test_hallucinated_search_after_forced_search_is_blocked_and_recovered(self):
         web = FakeWebSearch()
-        agent = Agent(
-            None, "pcc", "SYSTEM", extra_tools=[web], model_fallback="system"
-        )
+        agent = Agent(None, "pcc", "SYSTEM", extra_tools=[web], model_fallback="system")
         ghost_call = _tool_completion(
             "web_search",
             '{"query":"repeat the whole research","depth":"deep"}',
@@ -193,9 +189,7 @@ class AgentForcedSearchTests(TestCase):
 
     def test_repeated_tool_call_during_recovery_returns_tool_evidence(self):
         web = FakeWebSearch()
-        agent = Agent(
-            None, "pcc", "SYSTEM", extra_tools=[web], model_fallback="system"
-        )
+        agent = Agent(None, "pcc", "SYSTEM", extra_tools=[web], model_fallback="system")
         ghost = _tool_completion("web_search", '{"query":"repeat","depth":"deep"}')
 
         with patch("core.agent.call_llm", side_effect=[ghost, ghost]):
@@ -224,8 +218,7 @@ class AgentForcedSearchTests(TestCase):
 
     def test_model_cannot_escalate_simple_question_to_deep_or_search_twice(self):
         web = FakeWebSearch()
-        agent = Agent(None, "system", "SYSTEM", extra_tools=[web],
-                      model_fallback="system")
+        agent = Agent(None, "system", "SYSTEM", extra_tools=[web], model_fallback="system")
 
         with patch(
             "core.agent.call_llm",
@@ -235,7 +228,7 @@ class AgentForcedSearchTests(TestCase):
                 _completion("В Норвегии 357 коммун."),
             ],
         ):
-            reply = agent.run_turn("расскажи про коммуны Норвегии")
+            agent.run_turn("расскажи про коммуны Норвегии")
 
         web.execute.assert_called_once()
         self.assertEqual(web.execute.call_args.kwargs["depth"], "auto")
@@ -293,10 +286,12 @@ class AgentForcedSearchTests(TestCase):
             ),
         ]
         batch = SimpleNamespace(
-            choices=[SimpleNamespace(
-                message=SimpleNamespace(content="", tool_calls=calls),
-                finish_reason="tool_calls",
-            )],
+            choices=[
+                SimpleNamespace(
+                    message=SimpleNamespace(content="", tool_calls=calls),
+                    finish_reason="tool_calls",
+                )
+            ],
         )
         bash_execute = Mock()
         agent.handlers["execute_bash"] = bash_execute

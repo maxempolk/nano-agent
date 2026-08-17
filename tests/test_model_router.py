@@ -56,9 +56,7 @@ class AppleModelRouterTests(TestCase):
 
     def test_forced_modes_override_heuristics(self):
         complex_request = "Реализуй и протестируй сложную архитектуру"
-        local_route = AppleModelRouter(
-            self.local, self.pcc, "local"
-        ).select(complex_request).route
+        local_route = AppleModelRouter(self.local, self.pcc, "local").select(complex_request).route
         self.assertEqual(local_route.model, "system")
         self.assertIsNone(local_route.fallback_model)
         self.assertEqual(

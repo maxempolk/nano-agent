@@ -20,13 +20,12 @@ Telegram-интерфейсом. Простые запросы выполняю�
 ## Установка
 
 ```bash
-cp .env.example .env   # заполни токены
+cp .env.example .env
+uv sync --all-groups
 ```
 
-Зависимости устанавливаются через `uv` или `pip`:
-```bash
-pip install openai python-dotenv httpx
-```
+Проект требует Python 3.13+ и [uv](https://docs.astral.sh/uv/). `uv.lock`
+фиксирует полный набор зависимостей для воспроизводимой установки.
 
 ## Настройка `.env`
 
@@ -44,13 +43,20 @@ WEB_SEARCH_FORCE_DEPTH=auto # auto или принудительно quick, norm
 ## Запуск
 
 ```bash
-python main.py --cli                    # hybrid: AFM для простого, PCC для сложного
-python main.py --telegram               # тот же hybrid-режим в Telegram
-python main.py --cli --local            # строго только локальная AFM Core 3
-python main.py --cli --server           # строго только Apple PCC
-python main.py --cli --model local      # полный эквивалент --local
-python main.py --cli --model pcc        # полный эквивалент --server
-python main.py --cli --prompts mini     # общий override набора промптов
+uv run python main.py --cli                    # hybrid: AFM для простого, PCC для сложного
+uv run python main.py --telegram               # тот же hybrid-режим в Telegram
+uv run python main.py --cli --local            # строго только локальная AFM Core 3
+uv run python main.py --cli --server           # строго только Apple PCC
+uv run python main.py --cli --model local      # полный эквивалент --local
+uv run python main.py --cli --model pcc        # полный эквивалент --server
+uv run python main.py --cli --prompts mini     # общий override набора промптов
+```
+
+## Проверка качества
+
+```bash
+uv run ruff check .
+uv run python -m unittest discover -s tests
 ```
 
 В hybrid-режиме маршрутизатор оценивает длину, код, многошаговость и признаки

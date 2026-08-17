@@ -28,38 +28,19 @@ class SessionLogger:
         return datetime.now().strftime("%H:%M:%S")
 
     def user(self, text: str) -> None:
-        self._write(
-            f"[{self._ts()}] USER\n"
-            f"{_indent(text)}\n"
-            f"{DIVIDER}"
-        )
+        self._write(f"[{self._ts()}] USER\n{_indent(text)}\n{DIVIDER}")
 
     def tool_call(self, name: str, args: str) -> None:
-        self._write(
-            f"[{self._ts()}] TOOL CALL → {name}\n"
-            f"{_indent(args)}"
-        )
+        self._write(f"[{self._ts()}] TOOL CALL → {name}\n{_indent(args)}")
 
     def tool_result(self, result: str) -> None:
-        self._write(
-            f"[{self._ts()}] TOOL RESULT\n"
-            f"{_indent(result)}\n"
-            f"{DIVIDER}"
-        )
+        self._write(f"[{self._ts()}] TOOL RESULT\n{_indent(result)}\n{DIVIDER}")
 
     def agent(self, text: str) -> None:
-        self._write(
-            f"[{self._ts()}] AGENT\n"
-            f"{_indent(text)}\n"
-            f"{SESSION_DIVIDER}"
-        )
+        self._write(f"[{self._ts()}] AGENT\n{_indent(text)}\n{SESSION_DIVIDER}")
 
     def error(self, text: str) -> None:
-        self._write(
-            f"[{self._ts()}] ERROR\n"
-            f"{_indent(text)}\n"
-            f"{DIVIDER}"
-        )
+        self._write(f"[{self._ts()}] ERROR\n{_indent(text)}\n{DIVIDER}")
 
     def info(self, text: str) -> None:
         self._write(f"[{self._ts()}] INFO  {text}")
