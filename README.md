@@ -1,212 +1,143 @@
-# LLM Agent
+# Nano Agent
 
-Автономный AI-агент на Apple Intelligence с доступом к bash, CLI и
-Telegram-интерфейсом. Простые запросы выполняются локальной AFM Core 3,
-сложные автоматически направляются в Apple Private Cloud Compute.
+[Українська версія документації](docs/uk/README.md)
 
-## Возможности
+Nano Agent is a local-first, evidence-driven AI agent for Apple Intelligence.
+It provides CLI and Telegram interfaces, uses local AFM Core 3 for lightweight
+requests, and routes more demanding work to Apple Private Cloud Compute (PCC).
 
-- Выполняет bash-команды для решения задач пошагово
-- Отправляет сообщения, фото и документы в Telegram
-- Показывает вызванные инструменты, аргументы и результаты под Telegram-ответом
-- Сразу показывает в Telegram статус работы и обновляет его после каждого
-  инструмента, не создавая отдельное сообщение на каждый шаг
-- Очищает историю Telegram-диалога командой `/clear`
-- Показывает загрузку контекста через `/context` и запускает `/compact` вручную
-- Обрабатывает найденные страницы локальной моделью по отдельности и объединяет
-  проверенные Pydantic-структуры с фактами и ссылками на источники
-- Два интерфейса: терминал и Telegram-бот
+## Highlights
 
-## Установка
+- Uses bash tools to solve tasks step by step.
+- Provides CLI and Telegram interfaces, including messages, photos and documents.
+- Shows tool calls, arguments and results alongside Telegram responses.
+- Maintains conversation context and supports `/clear`, `/context` and `/compact`.
+- Researches the web with source URLs and validated Pydantic structures.
+- Routes requests between local and PCC models based on task complexity.
+
+## Requirements and Installation
+
+The project requires Python 3.13+ and [uv](https://docs.astral.sh/uv/).
+`uv.lock` pins the complete dependency set for reproducible installs.
 
 ```bash
 cp .env.example .env
 uv sync --all-groups
 ```
 
-Проект требует Python 3.13+ и [uv](https://docs.astral.sh/uv/). `uv.lock`
-фиксирует полный набор зависимостей для воспроизводимой установки.
-
-## Настройка `.env`
+## Configuration
 
 ```env
-TELEGRAM_BOT_TOKEN= # токен бота от @BotFather (опционально)
-ALLOWED_USER_ID=    # твой Telegram user_id (@userinfobot покажет)
-MODEL_MODE=hybrid   # hybrid, local или pcc (auto/server — совместимые aliases)
-PROMPT_PROFILE=     # необязательный общий override: full или mini
-LOCAL_CONTEXT_TOKEN_BUDGET= # по умолчанию 3000
-PCC_CONTEXT_TOKEN_BUDGET=   # по умолчанию 12000
-COMPACT_TRIGGER_RATIO= # доля N для compact, по умолчанию 0.8
-WEB_SEARCH_FORCE_DEPTH=auto # auto или принудительно quick, normal, deep
+TELEGRAM_BOT_TOKEN=                 # Optional token from @BotFather
+ALLOWED_USER_ID=                    # Optional Telegram user ID allowlist
+MODEL_MODE=hybrid                   # hybrid, local or pcc; auto/server are aliases
+PROMPT_PROFILE=                     # Optional global override: full or mini
+LOCAL_CONTEXT_TOKEN_BUDGET=         # Default: 3000
+PCC_CONTEXT_TOKEN_BUDGET=           # Default: 12000
+COMPACT_TRIGGER_RATIO=              # Default: 0.8
+WEB_SEARCH_FORCE_DEPTH=auto         # auto, quick, normal or deep
 ```
 
-## Запуск
+## Run
 
 ```bash
-uv run python main.py --cli                    # hybrid: AFM для простого, PCC для сложного
-uv run python main.py --telegram               # тот же hybrid-режим в Telegram
-uv run python main.py --cli --local            # строго только локальная AFM Core 3
-uv run python main.py --cli --server           # строго только Apple PCC
-uv run python main.py --cli --model local      # полный эквивалент --local
-uv run python main.py --cli --model pcc        # полный эквивалент --server
-uv run python main.py --cli --prompts mini     # общий override набора промптов
+uv run python main.py --cli                    # Hybrid mode
+uv run python main.py --telegram               # Hybrid mode in Telegram
+uv run python main.py --cli --local            # Local AFM Core 3 only
+uv run python main.py --cli --server           # Apple PCC only
+uv run python main.py --cli --model local      # Equivalent to --local
+uv run python main.py --cli --model pcc        # Equivalent to --server
+uv run python main.py --cli --prompts mini     # Use the compact prompt profile
 ```
 
-## Проверка качества
+## Quality Checks
 
 ```bash
 uv run ruff check .
 uv run python -m unittest discover -s tests
 ```
 
-В hybrid-режиме маршрутизатор оценивает длину, код, многошаговость и признаки
-разработки/анализа. Для `system` используется профиль `mini`, для `pcc` —
-`full`; история диалога у них общая. Выбранная модель видна в логах и под
-Telegram-ответом. Без model-флагов запускается именно hybrid. В `--local` PCC
-полностью отключён, включая planner и fallback; в `--server` аналогично не
-используется локальная AFM. Старые значения `auto` и `server` в `--model` или
-`MODEL_MODE` принимаются как aliases для `hybrid` и `pcc`.
+## Model Routing and Prompts
 
-Наборы находятся в `core/prompts.py`. Каждый профиль содержит отдельные части
-для обычного агента, Telegram, планировщика и cron-исполнителя. Чтобы добавить
-новый набор, создай `PromptProfile` и зарегистрируй его в `PROFILES`.
+In hybrid mode, the router evaluates request length, code, multi-step work and
+development or analysis signals. The local `system` model uses the `mini`
+profile, while PCC uses `full`; both share the same conversation history.
 
-## Контекст и compact
+`--local` disables PCC, including the planner and fallback. `--server` disables
+the local AFM model. Legacy `auto` and `server` values remain supported as
+aliases for `hybrid` and `pcc`.
 
-Агент хранит свежие сообщения дословно. При достижении 80% от
-активного лимита (`LOCAL_CONTEXT_TOKEN_BUDGET` или
-`PCC_CONTEXT_TOKEN_BUDGET`) старая завершённая часть диалога заменяется смысловым
-резюме через AFM (через PCC в строгом server-режиме), а последние 10 записей и
-текущий ход сохраняются.
-При следующем срабатывании прежнее резюме объединяется с новой историей. Если
-модель не смогла создать резюме, используется детерминированное сокращение.
-`/clear` удаляет и резюме, и свежие сообщения. Полные логи на диске не
-изменяются.
+Prompt profiles are defined in `core/prompts.py`. Each profile has dedicated
+instructions for the primary agent, Telegram, planner and cron runner.
 
-## Web search
+## Context Compaction
 
-`web_search` поддерживает режимы `auto`, `quick`, `normal` и `deep`. Короткие
-фактические вопросы в `auto` используют `quick`: DuckDuckGo-сниппеты и URL
-возвращаются основному агенту без загрузки страниц и без внутренних LLM-вызовов.
-Известные официальные домены получают приоритет. Для каждого поиска в лог
-записываются режим, этапы, время и число локальных генераций; общий call budget
-и deadline не позволяют одному запросу бесконтрольно запускать модель.
+The agent retains recent messages verbatim. At 80% of the active context budget,
+it replaces an older completed section with a semantic summary and preserves the
+last ten entries and current turn. If summarization fails, it uses a deterministic
+fallback. `/clear` removes both the summary and recent history; on-disk logs are
+not changed.
 
-По умолчанию используется `WEB_SEARCH_FORCE_DEPTH=auto`. Значения `quick`,
-`normal` и `deep` оставлены как диагностический override и перекрывают как
-автоматический выбор, так и `depth`, переданный моделью.
+## Web Research
 
-`normal` сначала получает общий structured plan с одним-двумя поисковыми
-запросами, затем выбирает максимум два источника и делает один extraction на
-источник. Отдельного synthesis нет; общий бюджет — три LLM-вызова.
+`web_search` supports `auto`, `quick`, `normal` and `deep` modes.
 
-`deep` запускается только для явно запрошенного исследования. Structured planner
-выделяет аспекты вопроса и формирует до пяти разных поисковых запросов.
-Результаты объединяются без дублей, а источники выбираются с учётом покрытия
-разных аспектов. До пяти страниц загружаются параллельно и обрабатываются
-двумя worker-ами. Один финальный synthesis объединяет факты и противоречия;
-пустой synthesis откатывается к уже извлечённым фактам. Общий бюджет — семь
-LLM-вызовов и 90 секунд.
+- **quick** returns validated DuckDuckGo snippets and URLs without loading pages
+  or using internal LLM calls.
+- **normal** creates a short structured plan, chooses up to two sources and
+  extracts one result from each source. Its total budget is three LLM calls.
+- **deep** is used only for explicitly requested research. It can plan up to five
+  queries, process up to five pages in parallel and combine evidence in a final
+  synthesis. Its total budget is seven calls and 90 seconds.
 
-В hybrid planner и synthesis выполняются на PCC, а извлечение отдельных страниц
-— бесплатно на AFM. В local все стадии выполняет AFM; в server все стадии идут
-через PCC.
+Known official domains are prioritized. Results are checked for relevance,
+freshness, expected values and source authority. A low-confidence automatic quick
+result can escalate to normal research; an explicitly selected quick search never
+escalates.
 
-Внутренние вызовы локальной модели ограничены безопасным входным бюджетом
-`6000/8192` токенов; oversized-фрагменты сокращаются до отправки. Пустой ответ
-не запускает бессмысленный JSON retry. Явная просьба подробно исследовать тему
-запускает один `deep` по полному исходному вопросу до первого ответа основной
-модели. После любого `web_search` все инструменты отключаются до конца текущего
-хода. Если AFM вернула несколько поисков или `curl` одним пакетом, выполняется
-только первый поиск. `deep`, выбранный моделью, понижается до `normal`, если
-пользователь явно не просил глубокий поиск или исследование.
+In hybrid mode, planning and synthesis use PCC while page extraction uses AFM.
+In local and PCC-only modes, every stage uses the selected provider. Input sizes,
+call budgets and deadlines prevent a single request from consuming unlimited work.
 
-Quick остаётся бесплатным и детерминированным: он классифицирует тип ожидаемого
-значения и проверяет сниппеты, но больше не содержит специальных переписываний
-для BTC, GPT, Норвегии или отдельных тестовых вопросов. Смысловая декомпозиция
-normal/deep выполняется общим planner-ом по structured-схеме.
+## Local Model Evaluation
 
-При `depth=auto` quick-выдача проходит детерминированную проверку релевантности,
-наличия ожидаемого значения, свежести и авторитетности. Если, например, запрос
-просит число, а сниппеты содержат только даты или связанные показатели, тот же
-вызов внутренне переходит `quick → normal`. Явный либо принудительный `quick`
-никогда не эскалируется. Причина и score сохраняются в `last_stats` и логах.
-
-Normal ранжирует все найденные страницы по прямому соответствию вопросу,
-официальному домену, свежести, назначению страницы и наличию ожидаемого значения.
-Извлечённые факты повторно проверяются детерминированно: связанные показатели и
-устаревшие датированные утверждения отбрасываются. В результате указываются URL,
-официальность, год источника и дата факта, когда она присутствует на странице.
-
-## Сравнение локальных моделей
-
-`benchmarks/agent_model_eval.py` проверяет OpenAI-совместимую модель на реальных
-обязанностях этого агента, а не только на общих академических вопросах. Набор
-содержит 45 тестов в шести группах:
-
-- `routing` — выбор ответа, поиска, глубины поиска или локального инструмента;
-- `tools` — настоящий function call, корректные аргументы и безопасный отказ;
-- `extraction` — факты с дословным evidence, датами, отрицаниями и prompt injection;
-- `finalization` — русский итог из источников, конфликты и неполное покрытие;
-- `recovery` — исправленный вызов после ошибки и остановка после трёх неудач;
-- `compact` — сохранение решений, ошибок и pending work без секретов и устаревших гипотез.
-
-Пример полного запуска для Apple FM:
+`benchmarks/agent_model_eval.py` evaluates an OpenAI-compatible model on agent
+work rather than generic questions. Its 45 cases cover routing, tool calling,
+evidence extraction, finalization, recovery and context compaction.
 
 ```bash
-python -m benchmarks.agent_model_eval \
-  --provider fm \
-  --model system
-```
+# Apple Foundation Models
+uv run python -m benchmarks.agent_model_eval --provider fm --model system
 
-Пример для LM Studio:
-
-```bash
-python -m benchmarks.agent_model_eval \
+# LM Studio or another OpenAI-compatible server
+uv run python -m benchmarks.agent_model_eval \
   --base-url http://127.0.0.1:1234/v1 \
   --model granite-4.0-h-tiny
-```
 
-Можно выбрать одну или несколько групп, сделать повторные прогоны и ограничить
-дорогой пилот:
-
-```bash
-python -m benchmarks.agent_model_eval --model system \
+# Run selected suites or a small pilot
+uv run python -m benchmarks.agent_model_eval --model system \
   --suite tools --suite extraction --repeat 3
-python -m benchmarks.agent_model_eval --model system --limit-per-suite 2
+uv run python -m benchmarks.agent_model_eval --model system --limit-per-suite 2
 ```
 
-По умолчанию structured-тесты сначала используют нативный `json_schema`. Если
-сервер его не поддерживает, режим `auto` повторяет запрос с явно отмеченным
-prompt-fallback. Для строгого сравнения транспорта используй
-`--structured-mode native` или `--structured-mode prompt`. JSONL с сырыми
-ответами и агрегированный отчёт записываются в `benchmark-results/`, который не
-попадает в git. Помимо качества отчёт показывает p50/p95 задержки, обычные и
-reasoning-токены, ошибки API и число schema-fallback.
+The runner writes raw JSONL responses and an aggregated report to
+`benchmark-results/`, which is excluded from Git. The report includes quality,
+p50/p95 latency, token use, API errors and schema fallbacks.
 
-Для моделей `system`/`pcc` и адреса Apple bridge на порту `1976` runner
-автоматически добавляет требуемый AFM `x-order`; для остальных серверов остаётся
-стандартный JSON Schema. Это можно переопределить через
-`--schema-dialect standard|afm`. Поле `agent_ready` становится истинным только
-после прохождения минимального порога в каждой группе: высокий средний балл не
-скрывает провал tool calling, extraction или восстановления после ошибок.
-При `--provider fm` вызовы идут напрямую через `fm respond`, без `fm serve`.
-Поскольку `fm respond` не предоставляет native function calls, группы `tools`
-и `recovery` используют явно отмеченный schema-mediated tool decision; их нельзя
-считать полностью эквивалентными function calling через OpenAI-compatible API.
+## Structure
 
-## Структура
-
-```
-├── main.py               # точка входа
-├── core/agent.py         # логика агента (LLM + tool calls)
-├── core/prompts.py       # сменные наборы системных промптов
-├── interfaces/cli.py     # терминальный интерфейс
-├── interfaces/telegram.py# Telegram-интерфейс
+```text
+main.py                    # Application entry point
+core/agent.py              # Agent orchestration and tool calls
+core/prompts.py            # Configurable system prompt profiles
+interfaces/cli.py          # Command-line interface
+interfaces/telegram.py     # Telegram interface
+benchmarks/                # Local-model evaluation suite
 ```
 
-## Модель
+## Model Provider
 
-Модели задаются в `core/config.py` и доступны через локальный Apple bridge
-`http://127.0.0.1:1976/v1`: alias `system` — on-device AFM Core 3, alias `pcc`
-— Apple Private Cloud Compute. Внешний API-ключ для моделей не нужен.
+Model configuration lives in `core/config.py`. The default local Apple bridge is
+`http://127.0.0.1:1976/v1`: `system` targets on-device AFM Core 3 and `pcc`
+targets Apple Private Cloud Compute. No external model API key is required for
+this configuration.
