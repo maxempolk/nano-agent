@@ -1,12 +1,11 @@
 from unittest import TestCase
 from unittest.mock import patch
 
-from test_agent_forced_search import FakeBashTool, _completion, _tool_completion
-
 from core.agent import SIMPLE_SYSTEM, Agent
 from core.model_router import AppleModelRouter, ModelRoute
 from core.prompts import PROFILES, build_prompt_set
 from core.tools.base import ToolRegistry
+from tests.test_agent_forced_search import FakeBashTool, _completion, _tool_completion
 
 
 def _kinds(events) -> list[str]:

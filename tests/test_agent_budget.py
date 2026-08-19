@@ -1,12 +1,11 @@
 from unittest import TestCase
 from unittest.mock import patch
 
-from test_agent_forced_search import FakeBashTool, _completion, _tool_completion
-
 from core.agent import Agent
 from core.budget import BudgetLimits
 from core.events import RunFailed
 from core.tools.base import ToolRegistry
+from tests.test_agent_forced_search import FakeBashTool, _completion, _tool_completion
 
 
 def _agent(tools, **budget_overrides) -> tuple[Agent, FakeBashTool]:

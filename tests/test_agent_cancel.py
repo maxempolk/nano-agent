@@ -5,11 +5,11 @@ from unittest import TestCase
 from unittest.mock import patch
 
 from pydantic import BaseModel
-from test_agent_forced_search import _tool_completion
 
 from core.agent import Agent
 from core.events import RunCancelled
 from core.tools.base import Tool, ToolContext, ToolRegistry, ToolResult
+from tests.test_agent_forced_search import _tool_completion
 
 
 class SlowInput(BaseModel):

@@ -335,6 +335,80 @@ def _process_message(
     _deliver_final(base, chat_id, status_message_id, outgoing, logger)
 
 
+def _cancel_command_reply(agent: Agent) -> str:
+    if agent.run_in_progress:
+        agent.cancel("команда /cancel")
+        return "⏹ Отменяю текущий запрос…"
+    return "Сейчас нет активного запроса."
+
+
+def _handle_update(
+    agent: Agent,
+    update: dict,
+    base: str,
+    token: str,
+    allowed_user_id: str,
+    run_lock: threading.Lock,
+    logger: SessionLogger | None = None,
+) -> None:
+    tg_message = update.get("message")
+    if not tg_message:
+        return
+
+    user_id = str(tg_message.get("from", {}).get("id", ""))
+    if user_id != allowed_user_id:
+        return
+
+    text = tg_message.get("text", "").strip()
+    if not text:
+        return
+
+    chat_id = tg_message["chat"]["id"]
+    print(f"[telegram] {user_id}: {text}")
+
+    command = _command_name(text)
+    if command in {"/clear", "/context", "/compact"}:
+        if logger:
+            logger.user(text)
+        try:
+            reply = _context_command_reply(agent, command) or "Неизвестная команда"
+        except Exception as e:
+            reply = f"Ошибка команды {command}: {e}"
+            if logger:
+                logger.error(reply)
+        if logger:
+            logger.agent(reply)
+        _send_messages(base, chat_id, [reply], logger)
+        return
+
+    if command == "/cancel":
+        _send_messages(base, chat_id, [_cancel_command_reply(agent)], logger)
+        return
+
+    if not run_lock.acquire(blocking=False):
+        _send_messages(
+            base,
+            chat_id,
+            [
+                "Я ещё обрабатываю предыдущий запрос. "
+                "Дождитесь результата или отправьте /cancel."
+            ],
+            logger,
+        )
+        return
+
+    if logger:
+        logger.user(text)
+
+    def worker() -> None:
+        try:
+            _process_message(agent, base, chat_id, text, token, logger)
+        finally:
+            run_lock.release()
+
+    threading.Thread(target=worker, name="telegram-run", daemon=True).start()
+
+
 def run(
     agent: Agent, token: str, allowed_user_id: str, logger: SessionLogger | None = None
 ) -> None:
@@ -371,65 +445,4 @@ def run(
 
         for update in updates:
             offset = update["update_id"] + 1
-
-            tg_message = update.get("message")
-            if not tg_message:
-                continue
-
-            user_id = str(tg_message.get("from", {}).get("id", ""))
-            if user_id != allowed_user_id:
-                continue
-
-            text = tg_message.get("text", "").strip()
-            if not text:
-                continue
-
-            chat_id = tg_message["chat"]["id"]
-            print(f"[telegram] {user_id}: {text}")
-
-            command = _command_name(text)
-            if command in {"/clear", "/context", "/compact"}:
-                if logger:
-                    logger.user(text)
-                try:
-                    reply = _context_command_reply(agent, command) or "Неизвестная команда"
-                except Exception as e:
-                    reply = f"Ошибка команды {command}: {e}"
-                    if logger:
-                        logger.error(reply)
-                if logger:
-                    logger.agent(reply)
-                _send_messages(base, chat_id, [reply], logger)
-                continue
-
-            if command == "/cancel":
-                if agent.run_in_progress:
-                    agent.cancel("команда /cancel")
-                    reply = "⏹ Отменяю текущий запрос…"
-                else:
-                    reply = "Сейчас нет активного запроса."
-                _send_messages(base, chat_id, [reply], logger)
-                continue
-
-            if not run_lock.acquire(blocking=False):
-                _send_messages(
-                    base,
-                    chat_id,
-                    [
-                        "Я ещё обрабатываю предыдущий запрос. "
-                        "Дождитесь результата или отправьте /cancel."
-                    ],
-                    logger,
-                )
-                continue
-
-            if logger:
-                logger.user(text)
-
-            def worker() -> None:
-                try:
-                    _process_message(agent, base, chat_id, text, token, logger)
-                finally:
-                    run_lock.release()
-
-            threading.Thread(target=worker, name="telegram-run", daemon=True).start()
+            _handle_update(agent, update, base, token, allowed_user_id, run_lock, logger)
