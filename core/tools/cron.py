@@ -1,7 +1,15 @@
+from __future__ import annotations
+
 import json
 import os
 import threading
 from datetime import datetime, timedelta
+from typing import ClassVar, Literal
+
+from pydantic import BaseModel, Field
+
+from core.policy import Capability
+from core.tools.base import Tool, ToolContext, ToolResult
 
 JOBS_FILE = "jobs.json"
 _lock = threading.Lock()
@@ -48,15 +56,15 @@ SCHEMA = {
 }
 
 
-def _load() -> list:
-    if not os.path.exists(JOBS_FILE):
+def _load(jobs_file: str = JOBS_FILE) -> list:
+    if not os.path.exists(jobs_file):
         return []
-    with open(JOBS_FILE, encoding="utf-8") as f:
+    with open(jobs_file, encoding="utf-8") as f:
         return json.load(f)
 
 
-def _save(jobs: list) -> None:
-    with open(JOBS_FILE, "w", encoding="utf-8") as f:
+def _save(jobs: list, jobs_file: str = JOBS_FILE) -> None:
+    with open(jobs_file, "w", encoding="utf-8") as f:
         json.dump(jobs, f, ensure_ascii=False, indent=2)
 
 
@@ -67,9 +75,10 @@ def execute(
     run_at: str = "",
     run_in: int = 0,
     prompt: str = "",
+    jobs_file: str = JOBS_FILE,
 ) -> str:
     with _lock:
-        jobs = _load()
+        jobs = _load(jobs_file)
 
         if action == "list":
             if not jobs:
@@ -93,11 +102,11 @@ def execute(
 
             if run_at and not schedule:
                 jobs.append({"name": name, "type": "once", "run_at": run_at, "prompt": prompt})
-                _save(jobs)
+                _save(jobs, jobs_file)
                 return f"Одноразовая задача '{name}' добавлена [run_at: {run_at}]."
             elif schedule:
                 jobs.append({"name": name, "type": "cron", "schedule": schedule, "prompt": prompt})
-                _save(jobs)
+                _save(jobs, jobs_file)
                 return f"Повторяющаяся задача '{name}' добавлена [{schedule}]."
             else:
                 return "Ошибка: укажите schedule, run_at или run_in."
@@ -109,15 +118,65 @@ def execute(
             jobs = [j for j in jobs if j["name"] != name]
             if len(jobs) == before:
                 return f"Задача '{name}' не найдена."
-            _save(jobs)
+            _save(jobs, jobs_file)
             return f"Задача '{name}' удалена."
 
         return f"Неизвестный action: {action}"
 
 
-def remove_job(name: str) -> None:
+def remove_job(name: str, jobs_file: str = JOBS_FILE) -> None:
     """Удаляет задачу из jobs.json (вызывается runner'ом после одноразовой задачи)."""
     with _lock:
-        jobs = _load()
+        jobs = _load(jobs_file)
         jobs = [j for j in jobs if j["name"] != name]
-        _save(jobs)
+        _save(jobs, jobs_file)
+
+
+class CronInput(BaseModel):
+    action: Literal["add", "list", "remove"]
+    name: str = Field(default="", max_length=120)
+    schedule: str = Field(default="", max_length=120)
+    run_at: str = Field(default="", max_length=60)
+    run_in: int = Field(default=0, ge=0, le=31_536_000)
+    prompt: str = Field(default="", max_length=2000)
+
+
+class CronManageTool(Tool):
+    """Scheduled-task management over the shared jobs file."""
+
+    name: ClassVar[str] = "cron_manage"
+    description: ClassVar[str] = SCHEMA["function"]["description"]
+    input_model: ClassVar[type[BaseModel]] = CronInput
+    capabilities: ClassVar[frozenset[Capability]] = frozenset({Capability.SCHEDULER_WRITE})
+    timeout: ClassVar[float] = 5.0
+    output_limit: ClassVar[int] = 2000
+
+    def __init__(self, jobs_file: str = JOBS_FILE, on_change=None):
+        self.jobs_file = jobs_file
+        self.on_change = on_change
+
+    def execute(self, args: CronInput, ctx: ToolContext) -> ToolResult:
+        ctx.raise_if_cancelled()
+        text = execute(
+            action=args.action,
+            name=args.name,
+            schedule=args.schedule,
+            run_at=args.run_at,
+            run_in=args.run_in,
+            prompt=args.prompt,
+            jobs_file=self.jobs_file,
+        )
+        failed = text.startswith("Ошибка") or text.endswith("не найдена.")
+        if failed:
+            retryable = "уже существует" not in text and "не найдена" not in text
+            return ToolResult.failure(text, code="validation", retryable=retryable)
+        if args.action in {"add", "remove"} and self.on_change is not None:
+            try:
+                self.on_change()
+            except Exception as error:  # noqa: BLE001 - scheduler reload is best-effort
+                return ToolResult(
+                    content=text,
+                    summary=text,
+                    warnings=(f"планировщик не перечитан: {error}",),
+                )
+        return ToolResult(content=text, summary=text)
