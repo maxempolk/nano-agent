@@ -32,6 +32,7 @@ class RouteDecision:
     route: ModelRoute
     reason: str
     score: int
+    automatic: bool = True
 
 
 class AppleModelRouter:
@@ -66,10 +67,12 @@ class AppleModelRouter:
         self._last_auto_route = self.local
 
     def select(self, user_input: str) -> RouteDecision:
+        # automatic=False: forced mode is not a "simple request" signal —
+        # tools and the full system prompt must stay available.
         if self.mode == "local":
-            return RouteDecision(self.local, "forced local mode", 0)
+            return RouteDecision(self.local, "forced local mode", 0, automatic=False)
         if self.mode == "pcc":
-            return RouteDecision(self.pcc, "forced PCC mode", 0)
+            return RouteDecision(self.pcc, "forced PCC mode", 0, automatic=False)
 
         score = 0
         reasons: list[str] = []

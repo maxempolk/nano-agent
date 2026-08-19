@@ -2502,8 +2502,9 @@ class WebSearchToolSpec(Tool):
 
 
 if __name__ == "__main__":
-    from core.config import APPLE_BASE_URL, APPLE_LOCAL_MODEL
+    from core.config import load_config
 
-    client = OpenAI(base_url=APPLE_BASE_URL, api_key="apple-local")
-    tool = WebSearchTool(client, APPLE_LOCAL_MODEL, model_mini=APPLE_LOCAL_MODEL)
+    config = load_config()
+    client = OpenAI(base_url=config.llm_base_url, api_key="apple-local")
+    tool = WebSearchTool(client, config.local_model, model_mini=config.local_model)
     print(tool.execute("Что такое абоба?"))

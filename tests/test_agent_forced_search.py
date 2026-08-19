@@ -1,6 +1,8 @@
 from types import SimpleNamespace
 from unittest import TestCase
-from unittest.mock import Mock, patch
+from unittest.mock import patch
+
+from pydantic import BaseModel
 
 from core.agent import (
     Agent,
@@ -8,6 +10,8 @@ from core.agent import (
     _forced_web_search_query,
     _validate_final_answer,
 )
+from core.policy import Capability
+from core.tools.base import Tool, ToolContext, ToolRegistry, ToolResult
 
 
 def _completion(text: str):
@@ -21,28 +25,18 @@ def _tool_completion(name: str, arguments: str):
         id="call-1",
         function=SimpleNamespace(name=name, arguments=arguments),
     )
-    message = SimpleNamespace(content="", tool_calls=[call])
+    message = SimpleNamespace(role="assistant", content="", tool_calls=[call])
     choice = SimpleNamespace(message=message, finish_reason="tool_calls")
     return SimpleNamespace(choices=[choice])
 
 
-class FakeWebSearch:
-    SCHEMA = {
-        "type": "function",
-        "function": {
-            "name": "web_search",
-            "description": "search",
-            "parameters": {
-                "type": "object",
-                "properties": {"query": {"type": "string"}},
-                "required": ["query"],
-            },
-        },
-    }
+class FakeSearchInput(BaseModel):
+    query: str
+    depth: str = "auto"
 
-    def __init__(self):
-        self.execute = Mock(return_value="[1] https://openai.com\nGPT-5.4")
-        self.last_query = "latest GPT version"
+
+class FakeBashInput(BaseModel):
+    command: str
 
 
 class FakeResearchResult:
@@ -51,6 +45,51 @@ class FakeResearchResult:
 
     def render_fallback(self):
         return "По результатам поиска: подтверждённый факт [1]."
+
+
+class FakeWebSearchTool(Tool):
+    name = "web_search"
+    description = "search"
+    input_model = FakeSearchInput
+    capabilities = frozenset({Capability.NETWORK_READ})
+    timeout = 5.0
+
+    def __init__(self, structured=None):
+        self.calls: list[dict] = []
+        self.last_query = "latest GPT version"
+        self.structured = structured
+
+    def execute(self, args: FakeSearchInput, ctx: ToolContext) -> ToolResult:
+        self.calls.append({"query": args.query, "depth": args.depth})
+        return ToolResult(
+            content="[1] https://openai.com\nGPT-5.4",
+            summary="поиск завершён",
+            structured=self.structured,
+            meta={"query": self.last_query},
+        )
+
+
+class FakeBashTool(Tool):
+    name = "execute_bash"
+    description = "bash"
+    input_model = FakeBashInput
+    capabilities = frozenset({Capability.SHELL_READ})
+    timeout = 5.0
+
+    def __init__(self):
+        self.calls: list[str] = []
+
+    def execute(self, args: FakeBashInput, ctx: ToolContext) -> ToolResult:
+        self.calls.append(args.command)
+        return ToolResult(content="ok")
+
+
+def _agent(web: FakeWebSearchTool, model: str = "system", fallback: str | None = None,
+           extra_tools: list[Tool] | None = None) -> Agent:
+    tools: list[Tool] = [web]
+    if extra_tools:
+        tools.extend(extra_tools)
+    return Agent(None, model, "SYSTEM", registry=ToolRegistry(tools), model_fallback=fallback)
 
 
 class AgentForcedSearchTests(TestCase):
@@ -84,9 +123,8 @@ class AgentForcedSearchTests(TestCase):
         )
 
     def test_json_from_pcc_is_rewritten_by_local_finalizer(self):
-        web = FakeWebSearch()
-        web.last_result = FakeResearchResult()
-        agent = Agent(None, "pcc", "SYSTEM", extra_tools=[web], model_fallback="system")
+        web = FakeWebSearchTool(structured=FakeResearchResult())
+        agent = _agent(web, model="pcc", fallback="system")
 
         with patch(
             "core.agent.call_llm",
@@ -101,9 +139,8 @@ class AgentForcedSearchTests(TestCase):
         self.assertEqual(len(llm.call_args_list), 2)
 
     def test_invalid_answers_from_both_models_use_structured_renderer(self):
-        web = FakeWebSearch()
-        web.last_result = FakeResearchResult()
-        agent = Agent(None, "pcc", "SYSTEM", extra_tools=[web], model_fallback="system")
+        web = FakeWebSearchTool(structured=FakeResearchResult())
+        agent = _agent(web, model="pcc", fallback="system")
 
         with patch(
             "core.agent.call_llm",
@@ -129,30 +166,27 @@ class AgentForcedSearchTests(TestCase):
         )
 
     def test_forced_search_runs_before_model_and_cannot_repeat_in_same_turn(self):
-        web = FakeWebSearch()
-        callback = Mock()
-        agent = Agent(None, "system", "SYSTEM", extra_tools=[web])
+        web = FakeWebSearchTool()
+        agent = _agent(web)
+        completed_events = []
+        agent.events.subscribe(lambda event: completed_events.append(event))
 
         with patch("core.agent.call_llm", return_value=_completion("GPT-5.4")) as llm:
-            reply = agent.run_turn(
-                "какая последняя версия gpt?",
-                on_tool_call=callback,
-            )
+            reply = agent.run_turn("какая последняя версия gpt?")
 
         self.assertEqual(reply, "GPT-5.4")
-        web.execute.assert_called_once_with(
-            query="какая последняя версия gpt?",
-            depth="auto",
-        )
-        callback.assert_called_once()
+        self.assertEqual(web.calls, [{"query": "какая последняя версия gpt?", "depth": "auto"}])
+        tool_completed = [e for e in completed_events if e.kind == "tool_completed"]
+        self.assertEqual(len(tool_completed), 1)
+        self.assertTrue(tool_completed[0].ok)
         self.assertEqual(agent.last_search_query, "latest GPT version")
         self.assertTrue(any(message.get("role") == "tool" for message in agent.messages))
         self.assertEqual(len(llm.call_args.args), 3)
         self.assertTrue(llm.call_args.args[2][0]["content"].startswith("Напиши ответ на вопрос"))
 
     def test_hallucinated_search_after_forced_search_is_blocked_and_recovered(self):
-        web = FakeWebSearch()
-        agent = Agent(None, "pcc", "SYSTEM", extra_tools=[web], model_fallback="system")
+        web = FakeWebSearchTool()
+        agent = _agent(web, model="pcc", fallback="system")
         ghost_call = _tool_completion(
             "web_search",
             '{"query":"repeat the whole research","depth":"deep"}',
@@ -165,7 +199,7 @@ class AgentForcedSearchTests(TestCase):
             reply = agent.run_turn("подробно исследуй уровень жизни в Норвегии")
 
         self.assertEqual(reply, "Один итоговый ответ")
-        web.execute.assert_called_once()
+        self.assertEqual(len(web.calls), 1)
         self.assertEqual(len(llm.call_args_list), 2)
         self.assertEqual(len(llm.call_args_list[1].args), 3)
         recovery_messages = llm.call_args_list[1].args[2]
@@ -177,32 +211,31 @@ class AgentForcedSearchTests(TestCase):
         self.assertIn("GPT-5.4", recovery_messages[-1]["content"])
 
     def test_empty_protocol_recovery_returns_tool_evidence_instead_of_silence(self):
-        web = FakeWebSearch()
-        agent = Agent(None, "system", "SYSTEM", extra_tools=[web])
+        web = FakeWebSearchTool()
+        agent = _agent(web)
 
         with patch("core.agent.call_llm", return_value=_completion("")):
             reply = agent.run_turn("подробно исследуй Норвегию")
 
         self.assertTrue(reply.strip())
         self.assertIn("GPT-5.4", reply)
-        web.execute.assert_called_once()
+        self.assertEqual(len(web.calls), 1)
 
     def test_repeated_tool_call_during_recovery_returns_tool_evidence(self):
-        web = FakeWebSearch()
-        agent = Agent(None, "pcc", "SYSTEM", extra_tools=[web], model_fallback="system")
+        web = FakeWebSearchTool()
+        agent = _agent(web, model="pcc", fallback="system")
         ghost = _tool_completion("web_search", '{"query":"repeat","depth":"deep"}')
 
         with patch("core.agent.call_llm", side_effect=[ghost, ghost]):
             reply = agent.run_turn("подробно исследуй Норвегию")
 
         self.assertIn("GPT-5.4", reply)
-        web.execute.assert_called_once()
+        self.assertEqual(len(web.calls), 1)
 
     def test_unoffered_tool_is_never_executed(self):
-        web = FakeWebSearch()
-        agent = Agent(None, "system", "SYSTEM", extra_tools=[web])
-        shell = Mock()
-        agent.handlers["not_offered"] = shell
+        web = FakeWebSearchTool()
+        agent = _agent(web)
+        self.assertFalse(agent.registry.has("not_offered"))
 
         with patch(
             "core.agent.call_llm",
@@ -214,11 +247,10 @@ class AgentForcedSearchTests(TestCase):
             reply = agent.run_turn("hello")
 
         self.assertEqual(reply, "recovered")
-        shell.assert_not_called()
 
     def test_model_cannot_escalate_simple_question_to_deep_or_search_twice(self):
-        web = FakeWebSearch()
-        agent = Agent(None, "system", "SYSTEM", extra_tools=[web], model_fallback="system")
+        web = FakeWebSearchTool()
+        agent = _agent(web, fallback="system")
 
         with patch(
             "core.agent.call_llm",
@@ -230,12 +262,12 @@ class AgentForcedSearchTests(TestCase):
         ):
             agent.run_turn("расскажи про коммуны Норвегии")
 
-        web.execute.assert_called_once()
-        self.assertEqual(web.execute.call_args.kwargs["depth"], "auto")
+        self.assertEqual(len(web.calls), 1)
+        self.assertEqual(web.calls[0]["depth"], "auto")
 
     def test_explicit_user_deep_intent_is_preserved(self):
-        web = FakeWebSearch()
-        agent = Agent(None, "system", "SYSTEM", extra_tools=[web])
+        web = FakeWebSearchTool()
+        agent = _agent(web)
 
         with patch(
             "core.agent.call_llm",
@@ -243,9 +275,8 @@ class AgentForcedSearchTests(TestCase):
         ) as llm:
             agent.run_turn("подробно исследуй реформу коммун")
 
-        web.execute.assert_called_once_with(
-            query="подробно исследуй реформу коммун",
-            depth="deep",
+        self.assertEqual(
+            web.calls, [{"query": "подробно исследуй реформу коммун", "depth": "deep"}]
         )
         self.assertEqual(len(llm.call_args.args), 3)
 
@@ -260,8 +291,9 @@ class AgentForcedSearchTests(TestCase):
         self.assertEqual(_forced_web_search_depth(request), "deep")
 
     def test_batched_web_search_executes_only_first_call_and_blocks_bash(self):
-        web = FakeWebSearch()
-        agent = Agent(None, "system", "SYSTEM", extra_tools=[web])
+        web = FakeWebSearchTool()
+        bash = FakeBashTool()
+        agent = _agent(web, extra_tools=[bash])
         calls = [
             SimpleNamespace(
                 id="search-1",
@@ -288,13 +320,11 @@ class AgentForcedSearchTests(TestCase):
         batch = SimpleNamespace(
             choices=[
                 SimpleNamespace(
-                    message=SimpleNamespace(content="", tool_calls=calls),
+                    message=SimpleNamespace(role="assistant", content="", tool_calls=calls),
                     finish_reason="tool_calls",
                 )
             ],
         )
-        bash_execute = Mock()
-        agent.handlers["execute_bash"] = bash_execute
 
         with patch(
             "core.agent.call_llm",
@@ -303,13 +333,13 @@ class AgentForcedSearchTests(TestCase):
             reply = agent.run_turn("расскажи о Норвегии")
 
         self.assertEqual(reply, "Готово")
-        web.execute.assert_called_once_with(query="Norway income", depth="auto")
-        bash_execute.assert_not_called()
+        self.assertEqual(web.calls, [{"query": "Norway income", "depth": "auto"}])
+        self.assertEqual(bash.calls, [])
         self.assertEqual(len(llm.call_args_list[1].args), 3)
 
     def test_invalid_first_batched_search_still_disables_tools(self):
-        web = FakeWebSearch()
-        agent = Agent(None, "system", "SYSTEM", extra_tools=[web])
+        web = FakeWebSearchTool()
+        agent = _agent(web)
         malformed = _tool_completion("web_search", '{"query":')
 
         with patch(
@@ -319,5 +349,29 @@ class AgentForcedSearchTests(TestCase):
             reply = agent.run_turn("расскажи о Норвегии")
 
         self.assertEqual(reply, "recovered")
-        web.execute.assert_not_called()
+        self.assertEqual(web.calls, [])
         self.assertEqual(llm.call_args_list[1].args[3], [])
+
+    def test_invalid_arguments_are_reported_to_model_without_execution(self):
+        web = FakeWebSearchTool()
+        agent = _agent(web)
+        bad_args = _tool_completion("web_search", '{"query":123}')
+
+        with patch(
+            "core.agent.call_llm",
+            side_effect=[bad_args, _completion("исправился")],
+        ):
+            reply = agent.run_turn("расскажи про версии Python")
+
+        self.assertEqual(reply, "исправился")
+        self.assertEqual(web.calls, [])
+        tool_message = next(
+            m for m in agent.messages if isinstance(m, dict) and m.get("role") == "tool"
+        )
+        self.assertIn("невалидные аргументы", tool_message["content"])
+
+
+if __name__ == "__main__":
+    import unittest
+
+    unittest.main()
