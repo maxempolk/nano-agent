@@ -151,18 +151,21 @@ local_prompts = build_prompt_set(
     system_info=_system_info(),
     telegram_token=config.telegram_bot_token,
     allowed_user_id=config.allowed_user_id,
+    work_dir=config.work_dir,
 )
 pcc_prompts = build_prompt_set(
     config.pcc_prompt_profile.value,
     system_info=_system_info(),
     telegram_token=config.telegram_bot_token,
     allowed_user_id=config.allowed_user_id,
+    work_dir=config.work_dir,
 )
 cloud_prompts = build_prompt_set(
     config.cloud_prompt_profile.value,
     system_info=_system_info(),
     telegram_token=config.telegram_bot_token,
     allowed_user_id=config.allowed_user_id,
+    work_dir=config.work_dir,
 )
 
 # Hybrid: AFM планирует normal и извлекает страницы, PCC планирует/синтезирует deep.
@@ -208,9 +211,16 @@ registry = ToolRegistry(
 )
 
 
-def _router(*, cron: bool = False) -> AppleModelRouter:
-    local_system = local_prompts.cron_agent if cron else local_prompts.agent
-    pcc_system = pcc_prompts.cron_agent if cron else pcc_prompts.agent
+def _router(*, cron: bool = False, work: bool = False) -> AppleModelRouter:
+    def system_for(prompt_set) -> str:
+        if cron:
+            return prompt_set.cron_agent
+        if work:
+            return prompt_set.work_agent or prompt_set.agent
+        return prompt_set.agent
+
+    local_system = system_for(local_prompts)
+    pcc_system = system_for(pcc_prompts)
     local = ModelRoute(
         "local",
         config.local_model,
@@ -227,7 +237,7 @@ def _router(*, cron: bool = False) -> AppleModelRouter:
     )
     cloud = None
     if config.model_mode == "cloud":
-        cloud_system = cloud_prompts.cron_agent if cron else cloud_prompts.agent
+        cloud_system = system_for(cloud_prompts)
         cloud = ModelRoute(
             "cloud",
             config.cloud_model,
@@ -246,8 +256,8 @@ def _memory_lookup(query: str) -> str:
     return "\n".join(lines[-3:])
 
 
-def _make_agent(agent_logger, *, cron: bool = False) -> Agent:
-    router = _router(cron=cron)
+def _make_agent(agent_logger, *, cron: bool = False, work: bool = False) -> Agent:
+    router = _router(cron=cron, work=work)
     if config.model_mode == "cloud":
         initial = router.cloud
     elif config.model_mode == "pcc":
@@ -278,9 +288,10 @@ def _make_agent(agent_logger, *, cron: bool = False) -> Agent:
             if config.model_mode == "pcc"
             else config.local_model
         ),
-        budget_limits=config.budget,
+        budget_limits=config.work_budget if work else config.budget,
         policy=policy,
         memory_lookup=_memory_lookup,
+        work_mode=work,
     )
 
 
@@ -290,6 +301,16 @@ def cron_agent_factory():
     cron_logger.add_secret(config.allowed_user_id)
     cron_logger.info(f"mode=cron | apple={config.model_mode}")
     return _make_agent(cron_logger, cron=True)
+
+
+def work_agent_factory():
+    """Свежий агент на каждую work-задачу: свой контекст и увеличенный бюджет."""
+    work_logger = SessionLogger(config.log_dir)
+    work_logger.add_secret(config.telegram_bot_token)
+    work_logger.add_secret(config.allowed_user_id)
+    work_logger.add_secret(config.cloud_api_key)
+    work_logger.info(f"mode=work | model_mode={config.model_mode}")
+    return _make_agent(work_logger, work=True)
 
 
 agent = _make_agent(logger)
@@ -316,6 +337,8 @@ try:
             logger=logger,
             stt_client=stt_client,
             stt_model=config.stt_model,
+            work_agent_factory=work_agent_factory,
+            work_dir=config.work_dir,
         )
     else:
         from interfaces.cli import run

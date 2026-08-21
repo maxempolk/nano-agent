@@ -158,6 +158,9 @@ p50/p95 latency, token use, API errors and schema fallbacks.
   `/cancel` stops the active run. Each request runs in a worker thread, so
   the bot stays responsive while working. Voice messages are transcribed to
   text (Whisper via the `STT_*` / `CLOUD_*` provider) and handled like text.
+  `/work <task>` starts a long-running task (bigger budget, ~15 min): the agent
+  writes a plan to `work/plan.md`, appends findings to `work/findings.md` and
+  conclusions to `work/report.md`.
 
 ## Structure
 

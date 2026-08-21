@@ -6,6 +6,7 @@ class PromptSet:
     agent: str
     cron_agent: str
     compact: str
+    work_agent: str = ""
 
 
 @dataclass(frozen=True)
@@ -15,6 +16,7 @@ class PromptProfile:
     cron: str
     cron_agent: str
     compact: str
+    work_agent: str = ""
 
 
 FULL = PromptProfile(
@@ -63,6 +65,15 @@ Telegram:
 Это запланированная задача. Не вызывай cron_manage и не отправляй сообщения Telegram. Выполни задачу и верни обычный текст; планировщик доставит его.""",
     compact="""Суммируй транскрипт как долговременную память для другого агента.
 Сохрани цели и предпочтения пользователя, решения, важные факты, пути к файлам, выполненные действия и результаты, ошибки и незавершённую работу. Убери приветствия, повторы и устаревшие детали. Не выдумывай. Используй компактные пункты, максимум 1200 символов.""",
+    work_agent="""
+
+Долгая работа (work-режим). Рабочая папка: {work_dir}
+- ПЕРВЫЙ вызов инструмента — всегда execute_bash: mkdir -p {work_dir} и запись плана в {work_dir}/plan.md (шаги, источники, признаки готовности). До plan.md другие инструменты запрещены.
+- Иди по плану шаг за шагом и отмечай выполненное в plan.md.
+- Каждую полученную порцию данных сразу дописывай в {work_dir}/findings.md: факт, источник, дата. Не держи промежуточные результаты только в контексте.
+- Для исследования используй web_search с depth=deep, для конкретных страниц — read_url.
+- Если упёрся в лимит или ошибку — честно зафиксируй в findings.md, на чём остановился, и не выдумывай завершение.
+- Финальные выводы пиши в {work_dir}/report.md только на основе findings.md; в ответе дай краткую сводку и пути к файлам.""",
 )
 
 
@@ -92,6 +103,13 @@ Telegram: возвращай текст обычно; никогда не отп
     cron_agent="""
 Запланированная задача: выполни задачу, не планируй и не отправляй в Telegram, верни обычный текст.""",
     compact="""Сожми транскрипт в память. Сохрани цели, решения, факты, пути, результаты действий, ошибки и незавершённые задачи. Убери болтовню и повторы. Не выдумывай. Максимум 700 символов.""",
+    work_agent="""
+
+Work-режим, папка {work_dir}:
+- ПЕРВЫЙ вызов — execute_bash: mkdir -p {work_dir} и план в {work_dir}/plan.md; до plan.md другие инструменты запрещены.
+- Данные каждого шага сразу дописывай в {work_dir}/findings.md (факт, источник, дата).
+- Исследование — web_search depth=deep; готовые ссылки — read_url.
+- Выводы — в {work_dir}/report.md только по findings.md; в ответе сводка и пути к файлам.""",
 )
 
 
@@ -102,7 +120,12 @@ PROFILES = {
 
 
 def build_prompt_set(
-    name: str, *, system_info: str, telegram_token: str = "", allowed_user_id: str = ""
+    name: str,
+    *,
+    system_info: str,
+    telegram_token: str = "",
+    allowed_user_id: str = "",
+    work_dir: str = "",
 ) -> PromptSet:
     try:
         profile = PROFILES[name]
@@ -118,8 +141,13 @@ def build_prompt_set(
             allowed_user_id=allowed_user_id,
         )
 
+    work_agent = ""
+    if work_dir:
+        work_agent = base + telegram + profile.work_agent.format(work_dir=work_dir)
+
     return PromptSet(
         agent=base + telegram + profile.cron,
         cron_agent=base + profile.cron_agent,
         compact=profile.compact,
+        work_agent=work_agent,
     )

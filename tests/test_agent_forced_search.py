@@ -2,6 +2,8 @@ from types import SimpleNamespace
 from unittest import TestCase
 from unittest.mock import patch
 
+import httpx
+from openai import BadRequestError
 from pydantic import BaseModel
 
 from core.agent import (
@@ -261,10 +263,13 @@ class AgentForcedSearchTests(TestCase):
                 _tool_completion("not_offered", '{"command":"unsafe"}'),
                 _completion("recovered"),
             ],
-        ):
+        ) as call:
             reply = agent.run_turn("hello")
 
-        self.assertEqual(reply, "recovered")
+        # Нарушение протокола без доказательств завершается честным отказом,
+        # а не выдуманным ответом финализатора.
+        self.assertIn("не дал проверенных данных", reply)
+        self.assertEqual(call.call_count, 1)
 
     def test_model_cannot_escalate_simple_question_to_deep_or_search_twice(self):
         web = FakeWebSearchTool()
@@ -387,6 +392,46 @@ class AgentForcedSearchTests(TestCase):
             m for m in agent.messages if isinstance(m, dict) and m.get("role") == "tool"
         )
         self.assertIn("невалидные аргументы", tool_message["content"])
+
+
+class FailingWebSearchTool(FakeWebSearchTool):
+    def execute(self, args, ctx) -> ToolResult:
+        self.calls.append({"query": args.query, "depth": args.depth})
+        return ToolResult.failure("схема отклонена провайдером", code="tool_failed")
+
+
+class FinalizerBarrierTests(TestCase):
+    def test_failed_search_yields_honest_refusal_without_llm_finalizer(self):
+        web = FailingWebSearchTool()
+        agent = _agent(web)
+
+        with patch("core.agent.call_llm") as call:
+            reply = agent.run_turn("поищи последние новости про Python")
+
+        call.assert_not_called()
+        self.assertIn("не дал проверенных данных", reply)
+        self.assertIn("по памяти не буду", reply)
+        self.assertEqual(len(web.calls), 1)
+
+
+class ParseFailureRetryTests(TestCase):
+    def test_output_parse_failure_is_retried_once(self):
+        web = FakeWebSearchTool()
+        agent = _agent(web)
+        parse_error = BadRequestError(
+            "Parsing failed. The model generated output that could not be parsed. "
+            "code: output_parse_failed",
+            response=httpx.Response(400, request=httpx.Request("POST", "http://t")),
+            body=None,
+        )
+
+        with patch(
+            "core.agent.call_llm", side_effect=[parse_error, _completion("жив")]
+        ) as call:
+            reply = agent.run_turn("привет")
+
+        self.assertEqual(reply, "жив")
+        self.assertEqual(call.call_count, 2)
 
 
 if __name__ == "__main__":

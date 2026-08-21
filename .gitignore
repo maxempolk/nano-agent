@@ -5,4 +5,5 @@ __pycache__/
 logs/
 jobs.json
 notes.json
+work/
 benchmark-results/

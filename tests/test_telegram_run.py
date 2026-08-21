@@ -274,6 +274,89 @@ class VoiceMessageTests(TestCase):
         )
 
 
+class WorkCommandTests(TestCase):
+    def test_work_command_runs_task_via_factory(self):
+        agent = Agent(None, "system", "SYSTEM")
+        work_agent = Mock()
+        factory = Mock(return_value=work_agent)
+        lock = threading.Lock()
+        started = threading.Event()
+
+        def fake_process(proc_agent, *args, **kwargs):
+            started.set()
+
+        with patch("interfaces.telegram._process_message", side_effect=fake_process) as proc:
+            _handle_update(
+                agent,
+                _update("/work исследуй рынок ноутбуков"),
+                "base",
+                "tok",
+                "42",
+                lock,
+                work_agent_factory=factory,
+                work_holder={},
+            )
+
+        self.assertTrue(started.wait(2))
+        _wait_for_unlock(lock)
+        factory.assert_called_once()
+        self.assertIs(proc.call_args.args[0], work_agent)
+        self.assertEqual(proc.call_args.args[3], "исследуй рынок ноутбуков")
+
+    def test_work_command_without_task_shows_usage(self):
+        factory = Mock()
+        lock = threading.Lock()
+
+        with patch("interfaces.telegram._send_messages") as send:
+            _handle_update(
+                Agent(None, "system", "SYSTEM"),
+                _update("/work"),
+                "base",
+                "tok",
+                "42",
+                lock,
+                work_agent_factory=factory,
+            )
+
+        send.assert_called_once()
+        self.assertIn("Использование", send.call_args.args[2][0])
+        factory.assert_not_called()
+
+    def test_work_command_respects_busy_guard(self):
+        factory = Mock()
+        lock = threading.Lock()
+        lock.acquire()
+
+        with patch("interfaces.telegram._send_messages") as send:
+            _handle_update(
+                Agent(None, "system", "SYSTEM"),
+                _update("/work задача"),
+                "base",
+                "tok",
+                "42",
+                lock,
+                work_agent_factory=factory,
+            )
+
+        send.assert_called_once()
+        self.assertIn("обрабатываю предыдущий", send.call_args.args[2][0])
+        factory.assert_not_called()
+
+    def test_cancel_reaches_running_work_agent(self):
+        agent = Agent(None, "system", "SYSTEM")
+        work_agent = Mock()
+        lock = threading.Lock()
+        holder = {"agent": work_agent}
+
+        with patch("interfaces.telegram._send_messages") as send:
+            _handle_update(
+                agent, _update("/cancel"), "base", "tok", "42", lock, work_holder=holder
+            )
+
+        work_agent.cancel.assert_called_once_with("команда /cancel")
+        self.assertIn("work-задачу", send.call_args.args[2][0])
+
+
 class TranscribeVoiceTests(TestCase):
     def test_downloads_file_and_returns_transcription(self):
         stt = Mock()

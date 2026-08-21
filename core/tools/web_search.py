@@ -549,6 +549,9 @@ def _afm_generation_schema(model: type[BaseModel]) -> dict:
             if isinstance(properties, dict):
                 converted["additionalProperties"] = False
                 converted["x-order"] = list(properties)
+                # Строгий json_schema (Groq/OpenAI) требует перечислить в
+                # required каждое поле объекта, включая опциональные.
+                converted["required"] = list(properties)
         return converted
 
     return convert(schema, root=True)  # type: ignore[return-value]
@@ -658,17 +661,30 @@ class WebSearchTool:
             call_number = self._budget.consume_llm()
         started = time.monotonic()
         try:
-            return call_llm(
-                self.client,
-                model or self.model_mini,
-                messages,
-                response_format=response_format,
-            )
-        except Exception as error:
-            message = str(error).lower()
-            if "context size" in message or "maximum allowed context" in message:
-                raise SearchInputTooLarge(str(error)) from error
-            raise
+            for attempt in range(3):
+                try:
+                    return call_llm(
+                        self.client,
+                        model or self.model_mini,
+                        messages,
+                        response_format=response_format,
+                    )
+                except Exception as error:
+                    message = str(error).lower()
+                    if "context size" in message or "maximum allowed context" in message:
+                        raise SearchInputTooLarge(str(error)) from error
+                    # Дешёвые тарифы (Groq TPM) режут длинные конвейеры: ждём и
+                    # повторяем, вместо того чтобы ронять всё исследование.
+                    if "rate limit" in message and attempt + 1 < 3:
+                        wait = 5.0 * (attempt + 1)
+                        self._log(
+                            f"stage={stage}_rate_limited | attempt={attempt + 1}/3 | "
+                            f"wait={wait:.0f}s"
+                        )
+                        time.sleep(wait)
+                        continue
+                    raise
+            raise RuntimeError("unreachable")
         finally:
             elapsed = time.monotonic() - started
             call_text = f" | call={call_number}" if call_number is not None else ""

@@ -100,6 +100,29 @@ class LoadConfigTests(TestCase):
         self.assertEqual(load_config(env={}).notes_file, "notes.json")
         self.assertEqual(load_config(env={"NOTES_FILE": "my.json"}).notes_file, "my.json")
 
+    def test_work_budget_defaults(self):
+        config = load_config(env={})
+        self.assertEqual(config.work_budget.max_steps, 30)
+        self.assertEqual(config.work_budget.max_model_calls, 40)
+        self.assertEqual(config.work_budget.max_tool_calls, 40)
+        self.assertEqual(config.work_budget.max_wall_seconds, 900.0)
+        self.assertEqual(config.work_dir, "work")
+
+    def test_work_budget_overrides(self):
+        config = load_config(
+            env={"WORK_MAX_STEPS": "50", "WORK_MAX_SECONDS": "60", "WORK_DIR": "research"}
+        )
+        self.assertEqual(config.work_budget.max_steps, 50)
+        self.assertEqual(config.work_budget.max_wall_seconds, 60.0)
+        self.assertEqual(config.work_dir, "research")
+
+    def test_invalid_work_budget_is_reported(self):
+        with self.assertRaises(ConfigError) as caught:
+            load_config(env={"WORK_MAX_STEPS": "много"})
+        self.assertTrue(
+            any("WORK_MAX_STEPS" in problem for problem in caught.exception.problems)
+        )
+
     def test_invalid_number_is_reported(self):
         with self.assertRaises(ConfigError) as caught:
             load_config(env={"LOCAL_CONTEXT_TOKEN_BUDGET": "много"})

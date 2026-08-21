@@ -21,3 +21,21 @@ class PromptProfileTests(TestCase):
             self.assertIn("до одного вызова web_search", prompt)
             self.assertIn("официальные источники", prompt)
             self.assertIn("никогда не выдумывай проверенные источники", prompt)
+
+
+class WorkPromptTests(TestCase):
+    def test_full_work_agent_contains_plan_and_files(self):
+        prompts = build_prompt_set("full", system_info="sys", work_dir="work")
+        self.assertIn("work/plan.md", prompts.work_agent)
+        self.assertIn("findings.md", prompts.work_agent)
+        self.assertIn("report.md", prompts.work_agent)
+        self.assertNotIn("{work_dir}", prompts.work_agent)
+
+    def test_work_agent_disabled_without_work_dir(self):
+        prompts = build_prompt_set("full", system_info="sys")
+        self.assertEqual(prompts.work_agent, "")
+
+    def test_mini_profile_formats_own_work_dir(self):
+        prompts = build_prompt_set("mini", system_info="sys", work_dir="research")
+        self.assertIn("research/plan.md", prompts.work_agent)
+        self.assertNotIn("{work_dir}", prompts.work_agent)

@@ -163,6 +163,7 @@ _FINALIZER_QUICK_SYSTEM = (
     "Извлеки лучший доступный ответ из сниппетов, даже если данные неполные. "
     "Не пиши «невозможно ответить», если сниппеты содержат релевантную информацию — "
     "приведи то, что есть, с оговоркой о неполноте.\n"
+    "Не дополняй ответ собственными знаниями: только сниппеты.\n"
     "Начни с прямого ответа. Укажи источники."
 )
 
@@ -173,7 +174,9 @@ _FINALIZER_RESEARCH_SYSTEM = (
     "2. Если факты противоречат друг другу — укажи оба варианта с источниками.\n"
     "3. Если исследование частичное (Broad conclusion allowed: no) — "
     "скажи об этом и перечисли, чего не хватает.\n"
-    "4. Укажи источники."
+    "4. Укажи источники.\n"
+    "5. Используй ТОЛЬКО предоставленные факты. Не дополняй ответ собственными "
+    "знаниями и не выдумывай числа, даты или источники, которых нет в фактах."
 )
 
 _FINALIZER_EXAMPLE_USER = (
@@ -306,6 +309,7 @@ class Agent:
         budget_limits: BudgetLimits | None = None,
         policy: ExecutionPolicy | None = None,
         memory_lookup: Callable[[str], str] | None = None,
+        work_mode: bool = False,
     ):
         self.client = client
         self.model = model
@@ -335,6 +339,8 @@ class Agent:
         self._cancel_token: CancellationToken | None = None
         self._last_web_result = None
         self._memory_message: dict | None = None
+        self.work_mode = work_mode
+        self._work_plan_done = False
 
     # ------------------------------------------------------------------
     # tool access
@@ -509,6 +515,22 @@ class Agent:
         evidence: list[tuple[str, str]],
         budget: RunBudget | None = None,
     ) -> str:
+        # Без проверенных данных ответ не формируется: выдумка из знаний модели
+        # маскировала бы провал поиска.
+        usable = [
+            (name, text)
+            for name, text in evidence
+            if not text.startswith("Ошибка инструмента")
+        ]
+        if not usable:
+            problems = "; ".join(text[:180] for _, text in evidence) or "нет данных"
+            if self.logger:
+                self.logger.error("finalizer | skipped: no usable evidence")
+            return (
+                "Поиск не дал проверенных данных — инструменты вернули ошибки: "
+                f"{problems}. Отвечать по памяти не буду, чтобы не выдумать факты. "
+                "Могу попробовать другой запрос — подтверди."
+            )
         structured_result = (
             self._last_web_result
             if any(name == "web_search" for name, _ in evidence)
@@ -704,6 +726,9 @@ class Agent:
 
         # --- guaranteed web search before the model -------------------
         search_query = _forced_web_search_query(user_input, previous_user_input)
+        # В work-режиме сначала план через execute_bash, поиск — по решению модели.
+        if search_query and self.work_mode:
+            search_query = None
         if search_query and self.registry is not None and self.registry.has("web_search"):
             args = {
                 "query": search_query,
@@ -768,6 +793,14 @@ class Agent:
                         )
                     budget.consume_model_call()
                     response = call_llm(self.client, self.model, windowed)  # type: ignore
+                    used_model = self.model
+                elif "output_parse_failed" in str(e) or "Parsing failed" in str(e):
+                    # Модель выдала неструктурированный поток мыслей вместо
+                    # ответа — разовый повтор того же запроса.
+                    if self.logger:
+                        self.logger.error(f"output_parse_failed, retry once: {str(e)[:120]}")
+                    budget.consume_model_call()
+                    response = call_llm(self.client, self.model, windowed, turn_tools)  # type: ignore
                     used_model = self.model
                 else:
                     if self.logger:
@@ -898,10 +931,11 @@ class Agent:
                             )
 
                     result = self._execute_tool(call.function.name, args, ctx, budget)
-                    if call.function.name == "web_search":
+                    if call.function.name == "web_search" and result.ok:
                         search_completed = True
-                        # После поиска AFM должна сформировать ответ из результата,
-                        # а не повторять поиск или открывать URL через bash.
+                        # После успешного поиска AFM должна сформировать ответ из
+                        # результата, а не повторять поиск или открывать URL через
+                        # bash. Неудачный поиск оставляет модели право исправиться.
                         turn_tools = []
                     turn_evidence.append(
                         (call.function.name, self._evidence_for(result, call.function.name))
@@ -945,6 +979,14 @@ class Agent:
         ``allowed_names`` is enforced by the caller before reaching here,
         and the registry re-validates arguments before running anything.
         """
+        if self.work_mode and not self._work_plan_done and name != "execute_bash":
+            return ToolResult.failure(
+                "В work-режиме первым шагом создай план: вызови execute_bash — "
+                "mkdir -p рабочей папки и запись plan.md. Другие инструменты "
+                "доступны после этого.",
+                code="denied",
+                retryable=True,
+            )
         signature = call_signature(name, args)
         budget.consume_tool_call(signature)
         arguments_text = json.dumps(args, ensure_ascii=False)
@@ -987,6 +1029,8 @@ class Agent:
             query = result.meta.get("query") if result.meta else None
             if query:
                 self.last_search_query = query
+        if self.work_mode and name == "execute_bash" and result.ok:
+            self._work_plan_done = True
         return result
 
     def _tool_message_content(self, result: ToolResult) -> str:

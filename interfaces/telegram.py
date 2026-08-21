@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -394,6 +395,12 @@ def _cancel_command_reply(agent: Agent) -> str:
     return "Сейчас нет активного запроса."
 
 
+def _work_task(text: str) -> str:
+    """Задача из '/work <задача>'; пустая строка, если задачи нет."""
+    parts = text.split(maxsplit=1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
 def _handle_update(
     agent: Agent,
     update: dict,
@@ -404,6 +411,9 @@ def _handle_update(
     logger: SessionLogger | None = None,
     stt_client=None,
     stt_model: str = "",
+    work_agent_factory=None,
+    work_holder: dict | None = None,
+    work_dir: str = "",
 ) -> None:
     tg_message = update.get("message")
     if not tg_message:
@@ -448,7 +458,62 @@ def _handle_update(
         return
 
     if command == "/cancel":
-        _send_messages(base, chat_id, [_cancel_command_reply(agent)], logger)
+        reply = _cancel_command_reply(agent)
+        work_agent = (work_holder or {}).get("agent")
+        if work_agent is not None and not agent.run_in_progress:
+            work_agent.cancel("команда /cancel")
+            reply = "⏹ Отменяю work-задачу…"
+        _send_messages(base, chat_id, [reply], logger)
+        return
+
+    if command == "/work":
+        task = _work_task(text)
+        if not task:
+            _send_messages(
+                base,
+                chat_id,
+                ["Использование: /work <задача> — долгое выполнение с планом и файлами в work/."],
+                logger,
+            )
+            return
+        if work_agent_factory is None:
+            _send_messages(base, chat_id, ["Work-режим не настроен."], logger)
+            return
+        if not run_lock.acquire(blocking=False):
+            _send_messages(
+                base,
+                chat_id,
+                [
+                    "Я ещё обрабатываю предыдущий запрос. "
+                    "Дождитесь результата или отправьте /cancel."
+                ],
+                logger,
+            )
+            return
+        if logger:
+            logger.user(text)
+
+        def work_worker() -> None:
+            holder = work_holder if work_holder is not None else {}
+            try:
+                work_agent = work_agent_factory()
+                holder["agent"] = work_agent
+                _process_message(work_agent, base, chat_id, task, token, logger)
+                if work_dir and not os.path.exists(os.path.join(work_dir, "report.md")):
+                    _send_messages(
+                        base,
+                        chat_id,
+                        [
+                            f"⚠️ {work_dir}/report.md не создан — исполнитель "
+                            "соблюдал протокол work-режима не полностью."
+                        ],
+                        logger,
+                    )
+            finally:
+                holder.pop("agent", None)
+                run_lock.release()
+
+        threading.Thread(target=work_worker, name="telegram-work", daemon=True).start()
         return
 
     if not run_lock.acquire(blocking=False):
@@ -493,9 +558,12 @@ def run(
     logger: SessionLogger | None = None,
     stt_client=None,
     stt_model: str = "",
+    work_agent_factory=None,
+    work_dir: str = "",
 ) -> None:
     base = f"https://api.telegram.org/bot{token}"
     run_lock = threading.Lock()
+    work_holder: dict = {}
 
     # Пропускаем накопленные сообщения — обрабатываем только новые
     try:
@@ -537,4 +605,7 @@ def run(
                 logger,
                 stt_client=stt_client,
                 stt_model=stt_model,
+                work_agent_factory=work_agent_factory,
+                work_holder=work_holder,
+                work_dir=work_dir,
             )

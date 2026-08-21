@@ -95,6 +95,10 @@ class AppConfig(BaseModel):
     # Per-request run budget
     budget: BudgetLimits = Field(default_factory=BudgetLimits)
 
+    # Work mode (long-running tasks: /work)
+    work_budget: BudgetLimits = Field(default_factory=BudgetLimits)
+    work_dir: str = "work"
+
 
 def _env_str(env: Mapping[str, str], key: str, default: str = "") -> str:
     value = env.get(key)
@@ -295,6 +299,31 @@ def load_config(
         problems.append(f"бюджеты выполнения: {error}")
         budget = BudgetLimits()
 
+    # Work-режим наследует лимиты вывода/ошибок и расширяет шаги/время.
+    work_fields = dict(budget_fields)
+    for key, env_name, default, converter in (
+        ("max_steps", "WORK_MAX_STEPS", 30, int),
+        ("max_model_calls", "WORK_MAX_MODEL_CALLS", 40, int),
+        ("max_tool_calls", "WORK_MAX_TOOL_CALLS", 40, int),
+        ("max_wall_seconds", "WORK_MAX_SECONDS", 900.0, float),
+    ):
+        raw = env.get(env_name)
+        if raw is None or raw.strip() == "":
+            work_fields[key] = default
+            continue
+        try:
+            work_fields[key] = converter(raw)
+        except ValueError:
+            problems.append(f"{env_name} должен быть числом, получено '{raw}'")
+
+    try:
+        work_budget = BudgetLimits(**work_fields)
+    except ValueError as error:
+        problems.append(f"бюджеты work-режима: {error}")
+        work_budget = BudgetLimits()
+
+    values["work_dir"] = _env_str(env, "WORK_DIR", "work")
+
     if values["model_mode"] == "hybrid" and values["local_model"] == values["pcc_model"]:
         problems.append(
             "LOCAL_MODEL и PCC_MODEL должны различаться в hybrid режиме, "
@@ -314,6 +343,7 @@ def load_config(
         raise ConfigError(problems)
 
     values["budget"] = budget
+    values["work_budget"] = work_budget
     try:
         return AppConfig(**values)
     except ValidationError as error:
