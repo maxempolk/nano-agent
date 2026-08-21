@@ -18,7 +18,7 @@ from typing import Any
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
 
 from benchmarks.agent_cases import BenchmarkCase, cases_for
 from core.llm import _normalize_completion
@@ -70,13 +70,23 @@ class Score:
 
 def _norm(value: Any) -> str:
     text = str(value or "").casefold()
+    # Models emit typographic variants (NBSP, non-breaking hyphens); compare
+    # against plain ASCII so correct answers are not failed on formatting.
+    for fancy, plain in (("\u00a0", " "), ("\u2011", "-"), ("\u2010", "-"), ("\u2212", "-")):
+        text = text.replace(fancy, plain)
     text = re.sub(r"\s+", " ", text)
     return text.strip()
 
 
 def _contains_group(text: str, alternatives: list[str]) -> bool:
     normalized = _norm(text)
-    return any(_norm(item) in normalized for item in alternatives)
+    # Thousands separators differ across locales ("67 420" vs "67,420");
+    # compare a space-stripped variant too so formatting does not fail content.
+    compact = normalized.replace(" ", "")
+    return any(
+        _norm(item) in normalized or _norm(item).replace(" ", "") in compact
+        for item in alternatives
+    )
 
 
 def _json_object(text: str) -> dict[str, Any]:
@@ -708,6 +718,24 @@ def score_case(case: BenchmarkCase, reply: ModelReply) -> Score:
     raise ValueError(f"Unknown suite: {case.suite}")
 
 
+def _run_with_retry(
+    client: BenchmarkClient,
+    case: BenchmarkCase,
+    *,
+    retries: int = 3,
+    base_wait: float = 15.0,
+) -> ModelReply:
+    """Rate limits are transient: back off and retry instead of failing the case."""
+    for attempt in range(retries):
+        try:
+            return client.run(case)
+        except RateLimitError:
+            if attempt == retries - 1:
+                raise
+            time.sleep(base_wait * (attempt + 1))
+    raise AssertionError("unreachable")
+
+
 def _percentile(values: list[float], ratio: float) -> float:
     if not values:
         return 0.0
@@ -842,6 +870,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--repeat", type=int, default=1)
     parser.add_argument("--limit-per-suite", type=int, default=None)
     parser.add_argument("--output", type=Path, default=None)
+    parser.add_argument(
+        "--delay",
+        type=float,
+        default=0.0,
+        help="Seconds to sleep between cases (provider rate limits).",
+    )
     return parser.parse_args()
 
 
@@ -886,12 +920,14 @@ def main() -> int:
     for repeat in range(1, args.repeat + 1):
         for case in selected:
             index += 1
+            if args.delay and index > 1:
+                time.sleep(args.delay)
             server = None
             try:
                 if args.managed_fm_server:
                     server = _start_managed_fm_server(args.base_url)
                     client = make_client()
-                reply = client.run(case)
+                reply = _run_with_retry(client, case)
                 score = score_case(case, reply)
                 row = {
                     "case_id": case.id,

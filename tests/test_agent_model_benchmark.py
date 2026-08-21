@@ -1,10 +1,15 @@
 from unittest import TestCase
 
+import httpx
+from openai import RateLimitError
+
 from benchmarks.agent_cases import ALL_CASES, EXTRACTION_SCHEMA
 from benchmarks.agent_model_eval import (
     BenchmarkClient,
     ModelReply,
     _json_object,
+    _norm,
+    _run_with_retry,
     score_case,
     summarize,
 )
@@ -36,6 +41,10 @@ class AgentModelBenchmarkTests(TestCase):
 
     def test_json_parser_accepts_fenced_object(self):
         self.assertEqual(_json_object('```json\n{"x": 1}\n```'), {"x": 1})
+
+    def test_norm_folds_typographic_variants(self):
+        self.assertEqual(_norm("$67\u00a0420"), "$67 420")
+        self.assertEqual(_norm("2026\u201107\u201120"), "2026-07-20")
 
     def test_routing_scores_action_depth_and_query_semantics(self):
         case = next(item for item in ALL_CASES if item.id == "route_current_price")
@@ -148,3 +157,36 @@ class AgentModelBenchmarkTests(TestCase):
         self.assertIn("corrected call", instructions)
         self.assertIn("/tmp/report.txt", prompt)
         self.assertIn("/tmp/reports.txt", prompt)
+
+
+class _RateLimitingClient:
+    def __init__(self, failures: int):
+        self.failures = failures
+        self.calls = 0
+
+    def run(self, case):
+        self.calls += 1
+        if self.calls <= self.failures:
+            response = httpx.Response(429, request=httpx.Request("POST", "http://test"))
+            raise RateLimitError("rate limit", response=response, body=None)
+        return reply("ok")
+
+
+class RateLimitRetryTests(TestCase):
+    def setUp(self):
+        self.case = next(item for item in ALL_CASES if item.id == "route_greeting")
+
+    def test_recovers_after_transient_rate_limits(self):
+        client = _RateLimitingClient(failures=2)
+
+        result = _run_with_retry(client, self.case, retries=3, base_wait=0)
+
+        self.assertEqual(client.calls, 3)
+        self.assertEqual(result.content, "ok")
+
+    def test_gives_up_after_bounded_retries(self):
+        client = _RateLimitingClient(failures=5)
+
+        with self.assertRaises(RateLimitError):
+            _run_with_retry(client, self.case, retries=3, base_wait=0)
+        self.assertEqual(client.calls, 3)
