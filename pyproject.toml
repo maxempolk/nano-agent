@@ -5,6 +5,7 @@ description = "Evidence-driven AI agent for Apple Intelligence with CLI and Tele
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
+  "apscheduler>=3.10,<4.0",
   "crawl4ai>=0.7,<1.0",
   "ddgs>=9.0,<10.0",
   "httpx>=0.28,<1.0",

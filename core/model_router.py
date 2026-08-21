@@ -13,7 +13,7 @@ def resolve_model_mode(
 ) -> str:
     requested = "local" if local else "server" if server else (cli_model or env_mode or "hybrid")
     mode = {"auto": "hybrid", "server": "pcc"}.get(requested, requested)
-    if mode not in {"hybrid", "local", "pcc"}:
+    if mode not in {"hybrid", "local", "pcc", "cloud"}:
         raise ValueError(f"Неизвестный режим модели: {requested}")
     return mode
 
@@ -32,10 +32,11 @@ class RouteDecision:
     route: ModelRoute
     reason: str
     score: int
+    automatic: bool = True
 
 
 class AppleModelRouter:
-    """Routes simple turns on-device and complex work to Apple PCC."""
+    """Routes simple turns on-device and complex work to Apple PCC or a cloud model."""
 
     _COMPLEX = re.compile(
         r"\b(реализ\w*|разработ\w*|рефактор\w*|отлад\w*|дебаг\w*|"
@@ -58,18 +59,31 @@ class AppleModelRouter:
         re.IGNORECASE,
     )
 
-    def __init__(self, local: ModelRoute, pcc: ModelRoute, mode: str = "hybrid"):
+    def __init__(
+        self,
+        local: ModelRoute,
+        pcc: ModelRoute,
+        mode: str = "hybrid",
+        cloud: ModelRoute | None = None,
+    ):
         mode = resolve_model_mode(cli_model=mode)
+        if mode == "cloud" and cloud is None:
+            raise ValueError("cloud режим требует cloud-маршрут")
         self.local = replace(local, fallback_model=None) if mode == "local" else local
         self.pcc = replace(pcc, fallback_model=None) if mode == "pcc" else pcc
+        self.cloud = replace(cloud, fallback_model=None) if cloud is not None else None
         self.mode = mode
         self._last_auto_route = self.local
 
     def select(self, user_input: str) -> RouteDecision:
+        # automatic=False: forced mode is not a "simple request" signal —
+        # tools and the full system prompt must stay available.
         if self.mode == "local":
-            return RouteDecision(self.local, "forced local mode", 0)
+            return RouteDecision(self.local, "forced local mode", 0, automatic=False)
         if self.mode == "pcc":
-            return RouteDecision(self.pcc, "forced PCC mode", 0)
+            return RouteDecision(self.pcc, "forced PCC mode", 0, automatic=False)
+        if self.mode == "cloud":
+            return RouteDecision(self.cloud, "forced cloud mode", 0, automatic=False)
 
         score = 0
         reasons: list[str] = []

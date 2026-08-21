@@ -9,40 +9,67 @@
 - Python dependencies are defined in `pyproject.toml` and installed with
   `uv sync --all-groups`.
 - Run the test suite with `uv run python -m unittest discover -s tests`.
+- Lint with `uv run ruff check .`.
 
 ## Token Economy (top priority)
 - Keep system prompts as short as possible. Every word costs tokens.
-- Skills injected into the system prompt must be dense — no examples, no repeating what the model already knows, no filler.
-- `MAX_TOOL_OUTPUT` caps tool responses to avoid wasting tokens on huge bash output.
-- `CONTEXT_WINDOW` limits how many messages are sent to the API per request.
+- Prompt profiles (`mini`, `full`) are dense by design — no filler.
+- `max_tool_output` (run budget) caps tool responses to avoid wasting tokens
+  on huge outputs.
+- Context is compact-compacted before the active model's budget is exceeded.
 
 ## Architecture
 ```
-llm-agent/
-├── main.py                  # entry point: config, Agent init, interface dispatch
+nano-agent/
+├── main.py                  # entry point: typed config, policy, registry, interface dispatch
 ├── core/
-│   └── agent.py             # Agent class — LLM loop, tool calls, message history
+│   ├── agent.py             # Agent — single loop: budget, cancellation, events
+│   ├── budget.py            # RunBudget per user request
+│   ├── cancellation.py      # CancellationToken
+│   ├── events.py            # typed progress events
+│   ├── policy.py            # capability policy (workspace, external send, destructive)
+│   ├── config.py            # typed configuration with startup validation
+│   ├── llm.py               # OpenAI-compatible call wrapper
+│   ├── model_router.py      # hybrid/local/pcc routing
+│   ├── prompts.py           # prompt profiles
+│   ├── cron_runner.py       # APScheduler runner with cancel/stop
+│   └── tools/
+│       ├── base.py          # Tool protocol: Tool, ToolResult, ToolRegistry
+│       ├── bash.py          # safe workspace-pinned bash
+│       ├── web_search.py    # evidence-driven search + protocol adapter
+│       └── cron.py          # cron_manage tool
 ├── interfaces/
-│   ├── cli.py               # stdin/stdout loop
-│   └── telegram.py          # Telegram long-polling, user_id filter
+│   ├── cli.py               # terminal: events, Ctrl+C cancellation
+│   └── telegram.py          # long-polling: events, /cancel, worker thread
+├── tests/
+├── benchmarks/
 ├── .env
 └── CLAUDE.md
 ```
 
-- `Agent` in `core/agent.py` is interface-agnostic: accepts `user_input`, returns `reply`.
-- Each interface creates its own `Agent` instance with its own message history.
-- Skills (e.g. Telegram send) are string variables injected into `SYSTEM` at startup, only when the relevant env var is set.
-- All secrets come from `.env` via `python-dotenv`. Never hardcode tokens.
+- `Agent` in `core/agent.py` is interface-agnostic: accepts `user_input`,
+  returns `reply`; progress is delivered through `agent.events`.
+- Tools are registered once in a `ToolRegistry`; arguments are validated
+  before execution; only tools offered in a request can be executed.
+- All secrets come from `.env` via `python-dotenv`. Never hardcode tokens;
+  never write them into logs or events.
 
 ## Running
+
 ```bash
-python main.py --cli       # terminal
-python main.py --telegram  # Telegram bot (long polling)
+uv run python main.py --cli        # terminal
+uv run python main.py --telegram   # Telegram bot (long polling)
 ```
 
+Flags: `--local` (AFM only), `--server`/`--model pcc` (PCC only),
+`--model hybrid` (default), `--prompts mini|full`.
+
 ## Env vars
+
+See `.env.example` for the full annotated list. Highlights:
 - `LLM_BASE_URL` — OpenAI-compatible local bridge URL
 - `LOCAL_MODEL` / `PCC_MODEL` — local and PCC model aliases
 - `MODEL_MODE` — `hybrid`, `local` or `pcc`
-- `TELEGRAM_BOT_TOKEN` — Telegram bot token (optional; enables Telegram interface + skill)
-- `ALLOWED_USER_ID` — only Telegram user_id allowed to interact with the bot (user_id == chat_id in private chats)
+- `TELEGRAM_BOT_TOKEN` / `ALLOWED_USER_ID` — Telegram interface (both required together)
+- `BASH_WORKSPACE`, `BASH_TIMEOUT`, `BASH_APPROVAL`, `ALLOW_DESTRUCTIVE` — safe bash
+- `RUN_MAX_*` — per-request run budget

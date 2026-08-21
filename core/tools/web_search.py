@@ -22,7 +22,10 @@ from ddgs import DDGS
 from openai import OpenAI
 from pydantic import BaseModel, Field, ValidationError
 
+from core.cancellation import CancellationToken
 from core.llm import call_llm
+from core.policy import Capability
+from core.tools.base import Tool, ToolContext, ToolResult
 
 if TYPE_CHECKING:
     from core.logger import SessionLogger
@@ -432,17 +435,20 @@ class SearchBudget:
     started_at: float = field(default_factory=time.monotonic)
     llm_calls: int = 0
     lock: Lock = field(default_factory=Lock, repr=False)
+    cancel_token: CancellationToken | None = field(default=None, repr=False)
 
     @classmethod
-    def for_mode(cls, mode: SearchMode) -> SearchBudget:
+    def for_mode(cls, mode: SearchMode, cancel_token: CancellationToken | None = None) -> SearchBudget:
         max_calls, timeout = MODE_LIMITS[mode.value]
-        return cls(mode, max_calls, timeout)
+        return cls(mode, max_calls, timeout, cancel_token=cancel_token)
 
     @property
     def elapsed(self) -> float:
         return time.monotonic() - self.started_at
 
     def check_deadline(self) -> None:
+        if self.cancel_token is not None:
+            self.cancel_token.raise_if_cancelled()
         if self.elapsed >= self.timeout_seconds:
             raise SearchBudgetExceeded(f"web_search timeout exceeded ({self.timeout_seconds:.0f}s)")
 
@@ -543,6 +549,9 @@ def _afm_generation_schema(model: type[BaseModel]) -> dict:
             if isinstance(properties, dict):
                 converted["additionalProperties"] = False
                 converted["x-order"] = list(properties)
+                # Строгий json_schema (Groq/OpenAI) требует перечислить в
+                # required каждое поле объекта, включая опциональные.
+                converted["required"] = list(properties)
         return converted
 
     return convert(schema, root=True)  # type: ignore[return-value]
@@ -576,6 +585,7 @@ class WebSearchTool:
         self.last_plan: ResearchPlan | None = None
         self.last_result: ResearchResult | None = None
         self._budget: SearchBudget | None = None
+        self._cancel_token: CancellationToken | None = None
         self._aggregate = {
             "total": 0,
             "quick": 0,
@@ -651,17 +661,30 @@ class WebSearchTool:
             call_number = self._budget.consume_llm()
         started = time.monotonic()
         try:
-            return call_llm(
-                self.client,
-                model or self.model_mini,
-                messages,
-                response_format=response_format,
-            )
-        except Exception as error:
-            message = str(error).lower()
-            if "context size" in message or "maximum allowed context" in message:
-                raise SearchInputTooLarge(str(error)) from error
-            raise
+            for attempt in range(3):
+                try:
+                    return call_llm(
+                        self.client,
+                        model or self.model_mini,
+                        messages,
+                        response_format=response_format,
+                    )
+                except Exception as error:
+                    message = str(error).lower()
+                    if "context size" in message or "maximum allowed context" in message:
+                        raise SearchInputTooLarge(str(error)) from error
+                    # Дешёвые тарифы (Groq TPM) режут длинные конвейеры: ждём и
+                    # повторяем, вместо того чтобы ронять всё исследование.
+                    if "rate limit" in message and attempt + 1 < 3:
+                        wait = 5.0 * (attempt + 1)
+                        self._log(
+                            f"stage={stage}_rate_limited | attempt={attempt + 1}/3 | "
+                            f"wait={wait:.0f}s"
+                        )
+                        time.sleep(wait)
+                        continue
+                    raise
+            raise RuntimeError("unreachable")
         finally:
             elapsed = time.monotonic() - started
             call_text = f" | call={call_number}" if call_number is not None else ""
@@ -834,6 +857,10 @@ class WebSearchTool:
         if len(text) < 200:
             text = self._scrape_crawl4ai(url) or text
         return text or "Не удалось извлечь текст."
+
+    def read_page(self, url: str) -> str:
+        """Публичная точка входа в скрейпер: чтение конкретной страницы/PDF."""
+        return self._scrape(url)
 
     def _search(self, query: str) -> list[dict]:
         started = time.monotonic()
@@ -2345,7 +2372,9 @@ class WebSearchTool:
         mode = self._select_mode(query, depth)
         initial_mode = mode
         intent = self._analyze_intent(query)
-        budget = SearchBudget.for_mode(mode)
+        if self._cancel_token is not None:
+            self._cancel_token.raise_if_cancelled()
+        budget = SearchBudget.for_mode(mode, cancel_token=self._cancel_token)
         self._budget = budget
         self.last_plan = None
         self.last_result = None
@@ -2455,9 +2484,47 @@ class WebSearchTool:
             self._budget = None
 
 
-if __name__ == "__main__":
-    from core.config import APPLE_BASE_URL, APPLE_LOCAL_MODEL
+class WebSearchInput(BaseModel):
+    query: str = Field(min_length=1, max_length=600)
+    depth: str = Field(default="auto", pattern="^(auto|quick|normal|deep)$")
 
-    client = OpenAI(base_url=APPLE_BASE_URL, api_key="apple-local")
-    tool = WebSearchTool(client, APPLE_LOCAL_MODEL, model_mini=APPLE_LOCAL_MODEL)
+
+class WebSearchToolSpec(Tool):
+    """Protocol adapter around the evidence-driven WebSearchTool engine."""
+
+    name = "web_search"
+    description = (
+        "Search the web for explicit search requests and current or changing facts. "
+        "Returns source URLs and evidence. Call once per question."
+    )
+    input_model = WebSearchInput
+    capabilities = frozenset({Capability.NETWORK_READ})
+    timeout = 130.0
+    output_limit = 2500
+
+    def __init__(self, impl: WebSearchTool):
+        self.impl = impl
+
+    def execute(self, args: WebSearchInput, ctx: ToolContext) -> ToolResult:
+        self.impl._cancel_token = ctx.cancel
+        try:
+            text = self.impl.execute(args.query, args.depth)
+        finally:
+            self.impl._cancel_token = None
+        stats = self.impl.last_stats or {}
+        mode = stats.get("mode", "")
+        return ToolResult(
+            content=text,
+            summary=f"поиск завершён ({mode})" if mode else "поиск завершён",
+            structured=self.impl.last_result,
+            meta={"query": self.impl.last_query, "mode": mode},
+        )
+
+
+if __name__ == "__main__":
+    from core.config import load_config
+
+    config = load_config()
+    client = OpenAI(base_url=config.llm_base_url, api_key="apple-local")
+    tool = WebSearchTool(client, config.local_model, model_mini=config.local_model)
     print(tool.execute("Что такое абоба?"))

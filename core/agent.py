@@ -2,19 +2,36 @@ from __future__ import annotations
 
 import json
 import re
+import time
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
 from openai import BadRequestError, OpenAI, RateLimitError
 
+from core.budget import BudgetExceeded, BudgetLimits, RunBudget, call_signature
+from core.cancellation import CancellationToken, CancelledError
+from core.events import (
+    ContextCompacted,
+    EventBus,
+    ModelCompleted,
+    ModelStarted,
+    RouteSelected,
+    RunCancelled,
+    RunCompleted,
+    RunFailed,
+    RunStarted,
+    ToolCompleted,
+    ToolStarted,
+    preview,
+)
 from core.llm import call_llm
-from core.tools import bash
+from core.tools.base import ToolContext, ToolRegistry, ToolResult
 
 if TYPE_CHECKING:
     from core.logger import SessionLogger
     from core.model_router import RouteDecision
+    from core.policy import ExecutionPolicy
 
-MAX_TOOL_CALLS_PER_TURN = 20
 DEFAULT_TOKEN_BUDGET = 5500
 COMPACT_TRIGGER_RATIO = 0.8
 CHARS_PER_TOKEN = 3
@@ -29,6 +46,11 @@ EXPLICIT_WEB_SEARCH = re.compile(
     r"\b(загугл\w*|поищ\w*|ищи в сети|проверь в (?:сети|интернете)|"
     r"найди в (?:сети|интернете)|search online|search the web|browse the web|"
     r"google it|look it up)\b",
+    re.IGNORECASE,
+)
+# «поищи в памяти/заметках» — это про локальное хранилище notes, а не про веб.
+LOCAL_MEMORY_REFERENCE = re.compile(
+    r"\b(в памяти|в заметк\w*|в записк\w*|в notes|мо[ию] память|заметк\w*|notes)\b",
     re.IGNORECASE,
 )
 GENERIC_SEARCH_FOLLOWUP = re.compile(
@@ -47,7 +69,7 @@ CHANGING_WEB_FACT = re.compile(
     r"\b(?:цена|цене|стоимость|price|cost)\b.{0,30}"
     r"\b(?:битк\w*|bitcoin|btc|акци\w*|stock|iphone|айфон\w*)\b|"
     r"\b(?:битк\w*|bitcoin|btc)\b.{0,30}"
-    r"\b(?:цена|цене|стоимость|курс|price|cost)\b|"
+    r"\b(?:цена|цене|курс|price|cost)\b|"
     r"\bтоп\b.{0,20}\b(?:стран\w*|country|countries)\b)",
     re.IGNORECASE,
 )
@@ -74,10 +96,23 @@ def _message_dict(message) -> dict:
         return message
     if hasattr(message, "model_dump"):
         return message.model_dump(exclude_none=True)
-    return {
+    data = {
         "role": getattr(message, "role", "unknown"),
         "content": getattr(message, "content", ""),
     }
+    tool_calls = getattr(message, "tool_calls", None)
+    if tool_calls:
+        data["tool_calls"] = [
+            {
+                "id": getattr(call, "id", "") or "",
+                "function": {
+                    "name": getattr(getattr(call, "function", None), "name", ""),
+                    "arguments": getattr(getattr(call, "function", None), "arguments", ""),
+                },
+            }
+            for call in tool_calls
+        ]
+    return data
 
 
 def _estimate_tokens(messages: list, tools: list | None = None) -> int:
@@ -96,6 +131,8 @@ def _truncate(text: str, max_chars: int) -> str:
 
 
 def _forced_web_search_query(user_input: str, previous_user_input: str | None = None) -> str | None:
+    if LOCAL_MEMORY_REFERENCE.search(user_input):
+        return None
     if GENERIC_SEARCH_FOLLOWUP.match(user_input):
         return previous_user_input or user_input
     if (
@@ -109,10 +146,6 @@ def _forced_web_search_query(user_input: str, previous_user_input: str | None = 
 
 def _forced_web_search_depth(user_input: str) -> str:
     return "deep" if FORCED_DEEP_WEB_SEARCH.search(user_input) else "auto"
-
-
-def _without_tool(tools: list, name: str) -> list:
-    return [tool for tool in tools if tool.get("function", {}).get("name") != name]
 
 
 def _tool_names(tools: list) -> set[str]:
@@ -130,6 +163,7 @@ _FINALIZER_QUICK_SYSTEM = (
     "Извлеки лучший доступный ответ из сниппетов, даже если данные неполные. "
     "Не пиши «невозможно ответить», если сниппеты содержат релевантную информацию — "
     "приведи то, что есть, с оговоркой о неполноте.\n"
+    "Не дополняй ответ собственными знаниями: только сниппеты.\n"
     "Начни с прямого ответа. Укажи источники."
 )
 
@@ -140,7 +174,9 @@ _FINALIZER_RESEARCH_SYSTEM = (
     "2. Если факты противоречат друг другу — укажи оба варианта с источниками.\n"
     "3. Если исследование частичное (Broad conclusion allowed: no) — "
     "скажи об этом и перечисли, чего не хватает.\n"
-    "4. Укажи источники."
+    "4. Укажи источники.\n"
+    "5. Используй ТОЛЬКО предоставленные факты. Не дополняй ответ собственными "
+    "знаниями и не выдумывай числа, даты или источники, которых нет в фактах."
 )
 
 _FINALIZER_EXAMPLE_USER = (
@@ -244,21 +280,36 @@ def _validate_final_answer(
 
 
 class Agent:
+    """Single agent loop with one tool registry, one budget and one
+    cancellation token per user request.
+
+    Guarantees:
+    - the model can only run tools offered in the exact LLM request;
+    - arguments are validated before execution;
+    - budget overruns surface as honest messages, never hidden;
+    - progress is reported through one typed event stream;
+    - the final answer is never empty, never raw JSON or a tool call.
+    """
+
     def __init__(
         self,
         client: OpenAI,
         model: str,
         system: str,
+        registry: ToolRegistry | None = None,
         compact_keep_messages: int = 10,
         max_tool_output: int = 2000,
         logger: SessionLogger | None = None,
-        extra_tools: list | None = None,
         model_fallback: str | None = None,
         token_budget: int = DEFAULT_TOKEN_BUDGET,
         compact_prompt: str = DEFAULT_COMPACT_PROMPT,
         compact_trigger_ratio: float = COMPACT_TRIGGER_RATIO,
         route_selector: Callable[[str], RouteDecision] | None = None,
         compact_model: str | None = None,
+        budget_limits: BudgetLimits | None = None,
+        policy: ExecutionPolicy | None = None,
+        memory_lookup: Callable[[str], str] | None = None,
+        work_mode: bool = False,
     ):
         self.client = client
         self.model = model
@@ -271,6 +322,10 @@ class Agent:
         self.compact_model = compact_model or model
         self.compact_trigger_ratio = compact_trigger_ratio
         self.route_selector = route_selector
+        self.registry = registry
+        self.budget_limits = budget_limits or BudgetLimits()
+        self.policy = policy
+        self.memory_lookup = memory_lookup
         self.base_system = system
         self.memory = ""
         self.messages: list = [{"role": "system", "content": self.base_system}]
@@ -278,20 +333,42 @@ class Agent:
         self.last_route_name = "local" if model == "system" else model
         self.last_route_reason = "fixed model"
         self.last_route_score = 0
+        self.last_route_auto = True
+        self.events = EventBus()
+        self._turn_system: str | None = None
+        self._cancel_token: CancellationToken | None = None
+        self._last_web_result = None
+        self._memory_message: dict | None = None
+        self.work_mode = work_mode
+        self._work_plan_done = False
 
-        self.tools = [bash.SCHEMA]
-        self.handlers: dict = {"execute_bash": bash.execute}
-        self.tool_objects: dict = {}
-        for tool in extra_tools or []:
-            self.tools.append(tool.SCHEMA)  # type: ignore
-            name = tool.SCHEMA["function"]["name"]  # type: ignore
-            self.handlers[name] = tool.execute
-            self.tool_objects[name] = tool
+    # ------------------------------------------------------------------
+    # tool access
+    # ------------------------------------------------------------------
+    @property
+    def tools(self) -> list:
+        """OpenAI schemas of all registered tools (empty without registry)."""
+        return self.registry.schemas() if self.registry else []
 
+    # ------------------------------------------------------------------
+    # cancellation
+    # ------------------------------------------------------------------
+    def cancel(self, reason: str = "отмена пользователем") -> None:
+        if self._cancel_token is not None:
+            self._cancel_token.cancel(reason)
+
+    @property
+    def run_in_progress(self) -> bool:
+        return self._cancel_token is not None
+
+    # ------------------------------------------------------------------
+    # context management
+    # ------------------------------------------------------------------
     def clear_context(self) -> None:
         self.memory = ""
         self.messages = [{"role": "system", "content": self.base_system}]
         self.last_search_query = None
+        self._memory_message = None
         if self.logger:
             self.logger.info("Контекст очищен")
 
@@ -308,6 +385,7 @@ class Agent:
         self.last_route_name = route.name
         self.last_route_reason = decision.reason
         self.last_route_score = decision.score
+        self.last_route_auto = decision.automatic
         if self.logger:
             self.logger.info(
                 f"route={route.name} | model={route.model} | score={decision.score} | "
@@ -341,7 +419,7 @@ class Agent:
         return "\n\n".join(rows)
 
     def _context_messages(self) -> list:
-        system = self.base_system
+        system = self._turn_system or self.base_system
         if self.memory:
             system += f"\n\nConversation memory:\n{self.memory}"
         return [{"role": "system", "content": system}, *self.messages[1:]]
@@ -358,7 +436,7 @@ class Agent:
                 self.messages[i] = dict(self.messages[i])
                 self.messages[i]["content"] = _truncate(content, COMPRESSED_TOOL_CHARS)
 
-    def _compact_if_needed(self, force: bool = False) -> bool:
+    def _compact_if_needed(self, force: bool = False, budget: RunBudget | None = None) -> bool:
         before = _estimate_tokens(self._context_messages(), self.tools)
         trigger = int(self.token_budget * self.compact_trigger_ratio)
         if not force and before < trigger:
@@ -397,6 +475,8 @@ class Agent:
             {"role": "user", "content": transcript},
         ]
         try:
+            if budget is not None:
+                budget.consume_model_call()
             response = call_llm(self.client, self.compact_model, compact_messages)
             summary = (response.choices[0].message.content or "").strip()
             if not summary:
@@ -404,6 +484,10 @@ class Agent:
             summary = _truncate(summary, MAX_SUMMARY_CHARS)
             self.memory = summary
             self.messages = [self.messages[0], *self.messages[retain_start:]]
+        except BudgetExceeded:
+            raise
+        except CancelledError:
+            raise
         except Exception as e:
             if self.logger:
                 self.logger.error(f"Compact failed: {e}")
@@ -414,16 +498,41 @@ class Agent:
             self._shrink_tool_results()
 
         after = _estimate_tokens(self._context_messages(), self.tools)
-        if self.logger and after < before:
-            self.logger.info(
-                f"Контекст compact: ~{before} → ~{after} токенов, записей={len(self.messages)}"
-            )
+        if after < before:
+            self.events.emit(ContextCompacted(before_tokens=before, after_tokens=after))
+            if self.logger:
+                self.logger.info(
+                    f"Контекст compact: ~{before} → ~{after} токенов, записей={len(self.messages)}"
+                )
         return True
 
-    def _finalize_research(self, user_input: str, evidence: list[tuple[str, str]]) -> str:
-        web_tool = self.tool_objects.get("web_search")
+    # ------------------------------------------------------------------
+    # finalization
+    # ------------------------------------------------------------------
+    def _finalize_research(
+        self,
+        user_input: str,
+        evidence: list[tuple[str, str]],
+        budget: RunBudget | None = None,
+    ) -> str:
+        # Без проверенных данных ответ не формируется: выдумка из знаний модели
+        # маскировала бы провал поиска.
+        usable = [
+            (name, text)
+            for name, text in evidence
+            if not text.startswith("Ошибка инструмента")
+        ]
+        if not usable:
+            problems = "; ".join(text[:180] for _, text in evidence) or "нет данных"
+            if self.logger:
+                self.logger.error("finalizer | skipped: no usable evidence")
+            return (
+                "Поиск не дал проверенных данных — инструменты вернули ошибки: "
+                f"{problems}. Отвечать по памяти не буду, чтобы не выдумать факты. "
+                "Могу попробовать другой запрос — подтверди."
+            )
         structured_result = (
-            getattr(web_tool, "last_result", None)
+            self._last_web_result
             if any(name == "web_search" for name, _ in evidence)
             else None
         )
@@ -440,6 +549,8 @@ class Agent:
                     f"finalizer | start | attempt={attempt}/{len(models)} | model={model}"
                 )
             try:
+                if budget is not None:
+                    budget.consume_model_call()
                 response = call_llm(self.client, model, messages)
                 message = response.choices[0].message
                 finish_reason = response.choices[0].finish_reason
@@ -460,6 +571,10 @@ class Agent:
                         f"finalizer rejected | model={model} | reason="
                         f"{'tool_calls' if message.tool_calls else reason}"
                     )
+            except BudgetExceeded:
+                raise
+            except CancelledError:
+                raise
             except Exception as error:
                 if self.logger:
                     self.logger.error(f"finalizer failed | model={model} | error={error}")
@@ -468,8 +583,117 @@ class Agent:
             self.logger.error("finalizer | deterministic_fallback")
         return _tool_evidence_fallback(evidence, structured_result)
 
-    def run_turn(self, user_input: str, on_tool_call=None) -> str:
+    # ------------------------------------------------------------------
+    # turn execution
+    # ------------------------------------------------------------------
+    def run_turn(self, user_input: str) -> str:
+        token = CancellationToken()
+        self._cancel_token = token
+        budget = RunBudget(self.budget_limits)
+        started = time.monotonic()
+        self.events.emit(RunStarted(input_preview=preview(user_input)))
+        try:
+            reply = self._run_turn(user_input, budget, token)
+            self.events.emit(
+                RunCompleted(
+                    reply_preview=preview(reply),
+                    elapsed=round(time.monotonic() - started, 2),
+                    steps=budget.steps,
+                    model_calls=budget.model_calls,
+                    tool_calls=budget.tool_calls,
+                )
+            )
+            return reply
+        except BudgetExceeded as error:
+            reply = (
+                f"⚠️ Остановлено: {error}. Запрос не завершён — бюджет "
+                f"({budget.snapshot()}) исчерпан, результат не выдуман."
+            )
+            self._balance_pending_tool_calls(f"Выполнение остановлено: {error}")
+            self.messages.append({"role": "assistant", "content": reply})
+            if self.logger:
+                self.logger.error(f"budget exceeded | kind={error.kind} | {error}")
+            self.events.emit(RunFailed(error=str(error), elapsed=round(budget.elapsed, 2)))
+            return reply
+        except CancelledError:
+            reply = f"⏹ Выполнение отменено ({token.reason or 'без причины'})."
+            self._balance_pending_tool_calls("Вызов отменён пользователем.")
+            self.messages.append({"role": "assistant", "content": reply})
+            if self.logger:
+                self.logger.info(f"run cancelled | reason={token.reason}")
+            self.events.emit(
+                RunCancelled(reason=token.reason, elapsed=round(budget.elapsed, 2))
+            )
+            return reply
+        except KeyboardInterrupt:
+            self._balance_pending_tool_calls("Выполнение прервано.")
+            self.events.emit(
+                RunCancelled(reason="принудительное прерывание", elapsed=round(budget.elapsed, 2))
+            )
+            raise
+        except Exception as error:  # noqa: BLE001 - a turn must never die silently
+            reply = f"Внутренняя ошибка агента: {error}"
+            self._balance_pending_tool_calls(f"Выполнение прервано ошибкой: {error}")
+            self.messages.append({"role": "assistant", "content": reply})
+            if self.logger:
+                self.logger.error(reply)
+            self.events.emit(RunFailed(error=str(error), elapsed=round(budget.elapsed, 2)))
+            return reply
+        finally:
+            self._cancel_token = None
+
+    def _balance_pending_tool_calls(self, note: str) -> None:
+        """Close dangling assistant tool_calls so history stays API-valid."""
+        if not self.messages:
+            return
+        last = _message_dict(self.messages[-1])
+        role = last.get("role")
+        if not last.get("tool_calls") or role not in {"assistant", "unknown"}:
+            return
+        for call in last["tool_calls"]:
+            call_id = call.get("id", "") if isinstance(call, dict) else getattr(call, "id", "")
+            self.messages.append({"role": "tool", "tool_call_id": call_id, "content": note})
+
+    def _inject_memory(self, user_input: str) -> None:
+        """Автоматически подставляет сохранённые заметки, подходящие к запросу."""
+        if self.memory_lookup is None:
+            return
+        try:
+            memo = self.memory_lookup(user_input)
+        except Exception as error:  # noqa: BLE001 - память не должна ломать ход
+            if self.logger:
+                self.logger.error(f"memory lookup failed | {type(error).__name__}")
+            return
+        memo = (memo or "").strip()
+        if not memo:
+            return
+        block = {
+            "role": "system",
+            "content": (
+                "Сохранённые заметки (долговременная память), относящиеся к запросу:\n"
+                f"{memo}\n"
+                "Учитывай их в ответе, если они подходят по смыслу."
+            ),
+        }
+        self.messages.append(block)
+        self._memory_message = block
+        if self.logger:
+            self.logger.info(f"memory injected | chars={len(memo)}")
+
+    def _run_turn(
+        self, user_input: str, budget: RunBudget, token: CancellationToken
+    ) -> str:
+        self._turn_system = None
         self._select_route(user_input)
+        self.events.emit(
+            RouteSelected(
+                route=self.last_route_name,
+                model=self.model,
+                reason=self.last_route_reason,
+                score=self.last_route_score,
+                automatic=self.last_route_auto,
+            )
+        )
         previous_user_input = next(
             (
                 _message_dict(message).get("content")
@@ -478,98 +702,106 @@ class Agent:
             ),
             None,
         )
+        if self._memory_message is not None:
+            # Блок памяти прошлого хода одноразовый: убираем, чтобы он не
+            # копился в истории и не попадал в компакцию.
+            try:
+                self.messages.remove(self._memory_message)
+            except ValueError:
+                pass
+            self._memory_message = None
         self.messages.append({"role": "user", "content": user_input})
         if self.logger:
             self.logger.user(user_input)
+        self._inject_memory(user_input)
 
-        self.last_search_query: str | None = None
+        ctx = ToolContext(cancel=token, policy=self.policy, logger=self.logger)
+        self.last_search_query = None
+        self._last_web_result = None
         tool_calls_made = 0
         turn_tools = self.tools
+        allowed_names = _tool_names(turn_tools)
         search_completed = False
         turn_evidence: list[tuple[str, str]] = []
 
+        # --- guaranteed web search before the model -------------------
         search_query = _forced_web_search_query(user_input, previous_user_input)
-        web_handler = self.handlers.get("web_search")
-        if search_query and web_handler:
+        # В work-режиме сначала план через execute_bash, поиск — по решению модели.
+        if search_query and self.work_mode:
+            search_query = None
+        if search_query and self.registry is not None and self.registry.has("web_search"):
             args = {
                 "query": search_query,
                 "depth": _forced_web_search_depth(user_input),
             }
-            arguments = json.dumps(args, ensure_ascii=False)
-            call_id = f"forced-web-search-{len(self.messages)}"
             if self.logger:
                 self.logger.info(f"forced web_search | query={search_query}")
-            try:
-                result = _truncate(web_handler(**args), self.max_tool_output)
-            except Exception as error:
-                result = f"Ошибка вызова инструмента web_search: {error}"
-
-            tool_obj = self.tool_objects.get("web_search")
-            self.last_search_query = getattr(tool_obj, "last_query", search_query)
-            if self.logger:
-                self.logger.tool_call("web_search", arguments)
-                self.logger.tool_result(result)
-            if on_tool_call:
-                on_tool_call("web_search", arguments, result)
-            structured_result = getattr(tool_obj, "last_result", None)
-            evidence_result = (
-                structured_result.evidence_text()
-                if structured_result is not None and hasattr(structured_result, "evidence_text")
-                else result
-            )
-            turn_evidence.append(("web_search", evidence_result))
-
-            self.messages.extend(
-                [
-                    {
-                        "role": "assistant",
-                        "content": "",
-                        "tool_calls": [
-                            {
-                                "id": call_id,
-                                "type": "function",
-                                "function": {"name": "web_search", "arguments": arguments},
-                            }
-                        ],
-                    },
-                    {"role": "tool", "tool_call_id": call_id, "content": result},
-                ]
-            )
-            tool_calls_made = 1
+            result = self._execute_tool("web_search", args, ctx, budget)
+            tool_calls_made += 1
             search_completed = True
+            turn_evidence.append(("web_search", self._evidence_for(result, "web_search")))
+            self._append_exchange(
+                "web_search",
+                json.dumps(args, ensure_ascii=False),
+                f"forced-web-search-{len(self.messages)}",
+                result,
+            )
+            budget.note_tool_result(result.ok, result.error or "")
             # После гарантированного поиска этому ходу больше не нужны tools:
             # компактная AFM иначе пытается повторять web_search или curl через bash.
             turn_tools = []
 
         simple_mode = (
-            self.route_selector is not None and not search_completed and self.last_route_score == 0
+            self.route_selector is not None
+            and self.last_route_auto
+            and not search_completed
+            and self.last_route_score == 0
         )
         if simple_mode:
-            self.messages[0] = {"role": "system", "content": SIMPLE_SYSTEM}
+            self._turn_system = SIMPLE_SYSTEM
             turn_tools = []
             if self.logger:
                 self.logger.info("simple_mode | minimal prompt, no tools")
 
+        # --- main loop --------------------------------------------------
         while True:
-            self._compact_if_needed()
+            budget.consume_step()
+            token.raise_if_cancelled()
+            self._compact_if_needed(budget=budget)
             windowed = self._context_messages()
 
             if search_completed:
-                reply = self._finalize_research(user_input, turn_evidence)
+                token.raise_if_cancelled()
+                reply = self._finalize_research(user_input, turn_evidence, budget)
+                token.raise_if_cancelled()
                 self.messages.append({"role": "assistant", "content": reply})
                 if self.logger:
                     self.logger.agent(reply)
                 return reply
 
+            budget.consume_model_call()
+            self.events.emit(ModelStarted(model=self.model, step=budget.steps))
+            call_started = time.monotonic()
             try:
                 response = call_llm(self.client, self.model, windowed, turn_tools)  # type: ignore
+                used_model = self.model
             except BadRequestError as e:
                 if "tool_use_failed" in str(e):
                     if self.logger:
                         self.logger.error(
                             f"tool_use_failed (tool_calls={tool_calls_made}), retry without tools"
                         )
+                    budget.consume_model_call()
                     response = call_llm(self.client, self.model, windowed)  # type: ignore
+                    used_model = self.model
+                elif "output_parse_failed" in str(e) or "Parsing failed" in str(e):
+                    # Модель выдала неструктурированный поток мыслей вместо
+                    # ответа — разовый повтор того же запроса.
+                    if self.logger:
+                        self.logger.error(f"output_parse_failed, retry once: {str(e)[:120]}")
+                    budget.consume_model_call()
+                    response = call_llm(self.client, self.model, windowed, turn_tools)  # type: ignore
+                    used_model = self.model
                 else:
                     if self.logger:
                         self.logger.error(f"BadRequestError: {e}")
@@ -578,28 +810,29 @@ class Agent:
                 if self.model_fallback:
                     if self.logger:
                         self.logger.error(
-                            f"RateLimitError на {self.model}, переключаюсь на {self.model_fallback}: {e}"
+                            f"RateLimitError на {self.model}, переключаюсь на "
+                            f"{self.model_fallback}: {e}"
                         )
                     try:
-                        response = call_llm(self.client, self.model_fallback, windowed, turn_tools)  # type: ignore
+                        budget.consume_model_call()
+                        response = call_llm(
+                            self.client, self.model_fallback, windowed, turn_tools
+                        )  # type: ignore
+                        used_model = self.model_fallback
                     except Exception as e2:
-                        error_reply = f"Ошибка API (fallback): {e2}"
-                        if self.logger:
-                            self.logger.error(error_reply)
-                        self.messages.append({"role": "assistant", "content": error_reply})
-                        return error_reply
+                        raise RuntimeError(f"Ошибка API (fallback): {e2}") from e2
                 else:
-                    error_reply = f"Ошибка API: {e}"
-                    if self.logger:
-                        self.logger.error(error_reply)
-                    self.messages.append({"role": "assistant", "content": error_reply})
-                    return error_reply
-            except Exception as e:
-                error_reply = f"Ошибка API: {e}"
-                if self.logger:
-                    self.logger.error(error_reply)
-                self.messages.append({"role": "assistant", "content": error_reply})
-                return error_reply
+                    raise RuntimeError(f"Ошибка API: {e}") from e
+            self.events.emit(
+                ModelCompleted(
+                    model=used_model,
+                    step=budget.steps,
+                    finish_reason=str(response.choices[0].finish_reason or ""),
+                    tool_calls=len(response.choices[0].message.tool_calls or []),
+                    content_chars=len(response.choices[0].message.content or ""),
+                    elapsed=round(time.monotonic() - call_started, 2),
+                )
+            )
 
             message = response.choices[0].message
             finish_reason = response.choices[0].finish_reason
@@ -612,12 +845,11 @@ class Agent:
                 )
 
             if message.tool_calls:
-                allowed_tools = _tool_names(turn_tools)
                 forbidden_calls = [
                     call
                     for call in message.tool_calls
                     if (
-                        call.function.name not in allowed_tools
+                        call.function.name not in allowed_names
                         or (call.function.name == "web_search" and search_completed)
                     )
                 ]
@@ -626,20 +858,13 @@ class Agent:
                     if self.logger:
                         self.logger.error(
                             "tool protocol violation | "
-                            f"returned={names} | allowed={','.join(sorted(allowed_tools)) or '-'} | "
+                            f"returned={names} | allowed={','.join(sorted(allowed_names)) or '-'} | "
                             f"search_completed={str(search_completed).lower()}"
                         )
-                    reply = self._finalize_research(user_input, turn_evidence)
+                    reply = self._finalize_research(user_input, turn_evidence, budget)
                     self.messages.append({"role": "assistant", "content": reply})
                     if self.logger:
                         self.logger.error(reply)
-                    return reply
-
-                if tool_calls_made >= MAX_TOOL_CALLS_PER_TURN:
-                    reply = "Достигнут лимит вызовов инструментов за один ход. Остановился."
-                    if self.logger:
-                        self.logger.error(reply)
-                    self.messages.append({"role": "assistant", "content": reply})
                     return reply
 
                 self.messages.append(message)  # type: ignore
@@ -653,21 +878,11 @@ class Agent:
                     # цикл инструментов.
                     turn_tools = []
                 for call in message.tool_calls:
-                    if tool_calls_made >= MAX_TOOL_CALLS_PER_TURN:
-                        result = "Пропущено: достигнут лимит инструментов за один ход."
-                        self.messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": call.id,
-                                "content": result,
-                            }
-                        )
-                        continue
-
                     if first_web_call_id and call.id != first_web_call_id:
-                        result = (
-                            "Пропущено: в пакете с web_search выполняется только "
-                            "первый поиск; остальные инструменты заблокированы."
+                        result = ToolResult.failure(
+                            "в пакете с web_search выполняется только первый поиск; "
+                            "остальные инструменты заблокированы.",
+                            code="denied",
                         )
                         if self.logger:
                             self.logger.info(
@@ -677,7 +892,7 @@ class Agent:
                             {
                                 "role": "tool",
                                 "tool_call_id": call.id,
-                                "content": result,
+                                "content": result.model_text(),
                             }
                         )
                         continue
@@ -687,19 +902,22 @@ class Agent:
                         if not isinstance(args, dict):
                             raise ValueError("arguments must be a JSON object")
                     except (json.JSONDecodeError, ValueError) as error:
-                        args = {}
-                        result = f"Ошибка аргументов инструмента {call.function.name}: {error}"
+                        result = ToolResult.failure(
+                            f"невалидные аргументы: {error}", code="invalid_arguments",
+                            retryable=True,
+                        )
                         if self.logger:
                             self.logger.info(f"invalid tool arguments | name={call.function.name}")
                         self.messages.append(
                             {
                                 "role": "tool",
                                 "tool_call_id": call.id,
-                                "content": result,
+                                "content": result.model_text(),
                             }
                         )
                         tool_calls_made += 1
                         continue
+
                     if (
                         call.function.name == "web_search"
                         and args.get("depth") == "deep"
@@ -711,53 +929,140 @@ class Agent:
                                 "web_search depth downgraded deep→normal: "
                                 "no explicit deep intent in user message"
                             )
-                    handler = self.handlers.get(call.function.name)
-                    if not handler:
-                        result = f"Неизвестный инструмент: {call.function.name}"
-                    else:
-                        try:
-                            result = _truncate(handler(**args), self.max_tool_output)
-                        except TypeError as e:
-                            result = f"Ошибка вызова инструмента {call.function.name}: {e}"
 
-                    if call.function.name == "web_search":
+                    result = self._execute_tool(call.function.name, args, ctx, budget)
+                    if call.function.name == "web_search" and result.ok:
                         search_completed = True
-                        tool_obj = self.tool_objects.get("web_search")
-                        self.last_search_query = getattr(tool_obj, "last_query", args.get("query"))
-                        # После поиска AFM должна сформировать ответ из результата,
-                        # а не повторять поиск или открывать URL через bash.
+                        # После успешного поиска AFM должна сформировать ответ из
+                        # результата, а не повторять поиск или открывать URL через
+                        # bash. Неудачный поиск оставляет модели право исправиться.
                         turn_tools = []
-
-                    if self.logger:
-                        self.logger.tool_call(
-                            call.function.name,
-                            json.dumps(args, ensure_ascii=False),
-                        )
-                        self.logger.tool_result(result)
-                    if on_tool_call:
-                        on_tool_call(
-                            call.function.name,
-                            json.dumps(args, ensure_ascii=False),
-                            result,
-                        )
-                    evidence_result = result
-                    if call.function.name == "web_search":
-                        structured_result = getattr(tool_obj, "last_result", None)
-                        if structured_result is not None and hasattr(
-                            structured_result, "evidence_text"
-                        ):
-                            evidence_result = structured_result.evidence_text()
-                    turn_evidence.append((call.function.name, evidence_result))
-
+                    turn_evidence.append(
+                        (call.function.name, self._evidence_for(result, call.function.name))
+                    )
                     self.messages.append(
-                        {"role": "tool", "tool_call_id": call.id, "content": result}
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.id,
+                            "content": self._tool_message_content(result),
+                        }
                     )
                     tool_calls_made += 1
+                    budget.note_tool_result(result.ok, result.error or "")
             else:
-                reply = message.content or ""
-                if not reply and self.logger:
-                    self.logger.error(f"Пустой ответ от модели (finish_reason={finish_reason})")
+                token.raise_if_cancelled()
+                reply = (message.content or "").strip()
+                if not reply:
+                    if self.logger:
+                        self.logger.error(f"Пустой ответ от модели (finish_reason={finish_reason})")
+                    if turn_evidence:
+                        reply = self._finalize_research(user_input, turn_evidence, budget)
+                    else:
+                        reply = (
+                            "Модель вернула пустой ответ. Попробуйте переформулировать запрос."
+                        )
+                token.raise_if_cancelled()
                 self.messages.append({"role": "assistant", "content": reply})
                 if self.logger:
                     self.logger.agent(reply)
                 return reply
+
+    # ------------------------------------------------------------------
+    # tool execution helpers
+    # ------------------------------------------------------------------
+    def _execute_tool(
+        self, name: str, args: dict, ctx: ToolContext, budget: RunBudget
+    ) -> ToolResult:
+        """Validate, run, cap output and report one tool call.
+
+        Never executes calls that were not offered in the current request:
+        ``allowed_names`` is enforced by the caller before reaching here,
+        and the registry re-validates arguments before running anything.
+        """
+        if self.work_mode and not self._work_plan_done and name != "execute_bash":
+            return ToolResult.failure(
+                "В work-режиме первым шагом создай план: вызови execute_bash — "
+                "mkdir -p рабочей папки и запись plan.md. Другие инструменты "
+                "доступны после этого.",
+                code="denied",
+                retryable=True,
+            )
+        signature = call_signature(name, args)
+        budget.consume_tool_call(signature)
+        arguments_text = json.dumps(args, ensure_ascii=False)
+        self.events.emit(ToolStarted(name=name, args_summary=preview(arguments_text)))
+        if self.logger:
+            self.logger.tool_call(name, arguments_text)
+
+        started = time.monotonic()
+        if self.registry is None or not self.registry.has(name):
+            result = ToolResult.failure(
+                f"инструмент '{name}' недоступен в этом ходе", code="unknown_tool"
+            )
+        else:
+            result = self.registry.execute(name, args, ctx)
+        elapsed = round(time.monotonic() - started, 2)
+
+        if result.ok and len(result.content) > budget.limits.max_tool_output_chars:
+            result = ToolResult(
+                content=budget.cap_output(result.content),
+                summary=result.summary,
+                structured=result.structured,
+                meta=result.meta,
+                files_created=result.files_created,
+            )
+
+        self.events.emit(
+            ToolCompleted(
+                name=name,
+                summary=result.summary or preview(result.error or result.content),
+                ok=result.ok,
+                error_code=result.error_code or "",
+                elapsed=elapsed,
+            )
+        )
+        if self.logger:
+            self.logger.tool_result(result.model_text() if not result.ok else result.content)
+
+        if name == "web_search":
+            self._last_web_result = result.structured
+            query = result.meta.get("query") if result.meta else None
+            if query:
+                self.last_search_query = query
+        if self.work_mode and name == "execute_bash" and result.ok:
+            self._work_plan_done = True
+        return result
+
+    def _tool_message_content(self, result: ToolResult) -> str:
+        return result.model_text() if not result.ok else result.content
+
+    def _append_exchange(
+        self, name: str, arguments: str, call_id: str, result: ToolResult
+    ) -> None:
+        """Record a synthetic assistant tool_call + tool result pair."""
+        self.messages.extend(
+            [
+                {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": call_id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": arguments},
+                        }
+                    ],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": self._tool_message_content(result),
+                },
+            ]
+        )
+
+    def _evidence_for(self, result: ToolResult, name: str) -> str:
+        structured = result.structured
+        if name == "web_search" and structured is not None and hasattr(structured, "evidence_text"):
+            return structured.evidence_text()
+        return result.content if result.ok else result.model_text()

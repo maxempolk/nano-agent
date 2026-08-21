@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import os
 import re
+import threading
 import time
 from html import escape
 from urllib.parse import quote_plus
@@ -9,6 +11,7 @@ from urllib.parse import quote_plus
 import httpx
 
 from core.agent import Agent
+from core.events import AgentEvent, ToolCompleted, ToolStarted
 from core.logger import SessionLogger
 
 MAX_TRACE_ARGUMENT_CHARS = 180
@@ -213,11 +216,37 @@ def _telegram_post(
             logger.info(f"Telegram {method} ok | message_id={message_id}")
         return payload
     except Exception as error:
-        err = f"Telegram {method}: {error}"
+        # base содержит токен бота — не даём ему попасть в ошибки/логи
+        err = f"Telegram {method}: {str(error).replace(base, '<telegram api>')}"
         print(f"[telegram] {err}")
         if logger:
             logger.error(err)
         return None
+
+
+def _transcribe_voice(base: str, token: str, file_id: str, stt_client, stt_model: str) -> str:
+    """Скачивает голосовое из Telegram и распознаёт его в текст через STT-API."""
+    payload = _telegram_post(base, "getFile", {"file_id": file_id})
+    file_path = (payload or {}).get("result", {}).get("file_path") if payload else None
+    if not file_path:
+        raise RuntimeError("Telegram не отдал файл голосового")
+
+    file_base = f"https://api.telegram.org/file/bot{token}"
+    try:
+        response = httpx.get(f"{file_base}/{file_path}", timeout=60)
+        response.raise_for_status()
+        audio = response.content
+    except Exception as error:
+        raise RuntimeError(f"не удалось скачать аудио: {type(error).__name__}") from None
+
+    result = stt_client.audio.transcriptions.create(
+        model=stt_model,
+        # Telegram отдаёт голосовые в контейнере .oga (Ogg Opus); Groq
+        # принимает только .ogg/.opus из этого семейства.
+        file=("voice.ogg", audio),
+        response_format="text",
+    )
+    return str(result).strip()
 
 
 def _send_message(
@@ -283,10 +312,258 @@ def _deliver_final(
     _send_messages(base, chat_id, messages, logger)
 
 
+def _process_message(
+    agent: Agent,
+    base: str,
+    chat_id: int,
+    text: str,
+    token: str,
+    logger: SessionLogger | None,
+    voice: dict | None = None,
+    stt_client=None,
+    stt_model: str = "",
+) -> None:
+    """Run one agent turn and deliver the result. Executed in a worker
+    thread so polling stays responsive and /cancel can reach the run."""
+    tool_calls: list[tuple[str, str, str]] = []
+    pending_args: dict[str, str] = {}
+
+    if voice is not None:
+        status_message_id = _send_message(
+            base, chat_id, "🎤 <b>Распознаю голосовое…</b>", logger
+        )
+        try:
+            text = _transcribe_voice(
+                base, token, voice.get("file_id", ""), stt_client, stt_model
+            ).strip()
+        except Exception as error:  # noqa: BLE001 - voice input must not kill the run
+            err = f"Ошибка распознавания голоса: {type(error).__name__}: {str(error)[:200]}"
+            if logger:
+                logger.error(err)
+            _deliver_final(base, chat_id, status_message_id, ["Не удалось распознать голосовое."], logger)
+            return
+        if not text:
+            _deliver_final(base, chat_id, status_message_id, ["Не удалось распознать голосовое."], logger)
+            return
+        if logger:
+            logger.user(f"[voice] {text}")
+        if status_message_id is not None:
+            _edit_message(base, chat_id, status_message_id, _progress_message([]), logger)
+    else:
+        status_message_id = _send_message(base, chat_id, _progress_message([]), logger)
+
+    def listener(event: AgentEvent) -> None:
+        if isinstance(event, ToolStarted):
+            pending_args[event.name] = event.args_summary
+        elif isinstance(event, ToolCompleted):
+            arguments = pending_args.get(event.name, "")
+            result_text = event.summary if event.ok else f"ошибка: {event.error_code}"
+            tool_calls.append((event.name, arguments, result_text))
+            if status_message_id is not None:
+                _edit_message(
+                    base,
+                    chat_id,
+                    status_message_id,
+                    _progress_message(tool_calls, secret=token),
+                    logger,
+                )
+
+    agent.events.subscribe(listener)
+    try:
+        reply = _markdown_to_telegram_html(agent.run_turn(text))
+        reply += _model_badge(agent)
+        if agent.last_search_query:
+            url = f"https://duckduckgo.com/?q={quote_plus(agent.last_search_query)}"
+            query = escape(agent.last_search_query)
+            reply += f'\n\n<i>🔍 <a href="{url}">{query}</a></i>'
+        outgoing = _messages_with_tool_trace(reply, tool_calls, secret=token)
+    except Exception as e:  # noqa: BLE001 - delivery must survive any agent error
+        reply = f"Внутренняя ошибка агента: {e}"
+        outgoing = [reply]
+        if logger:
+            logger.error(reply)
+    finally:
+        agent.events.unsubscribe(listener)
+
+    _deliver_final(base, chat_id, status_message_id, outgoing, logger)
+
+
+def _cancel_command_reply(agent: Agent) -> str:
+    if agent.run_in_progress:
+        agent.cancel("команда /cancel")
+        return "⏹ Отменяю текущий запрос…"
+    return "Сейчас нет активного запроса."
+
+
+def _work_task(text: str) -> str:
+    """Задача из '/work <задача>'; пустая строка, если задачи нет."""
+    parts = text.split(maxsplit=1)
+    return parts[1].strip() if len(parts) > 1 else ""
+
+
+def _handle_update(
+    agent: Agent,
+    update: dict,
+    base: str,
+    token: str,
+    allowed_user_id: str,
+    run_lock: threading.Lock,
+    logger: SessionLogger | None = None,
+    stt_client=None,
+    stt_model: str = "",
+    work_agent_factory=None,
+    work_holder: dict | None = None,
+    work_dir: str = "",
+) -> None:
+    tg_message = update.get("message")
+    if not tg_message:
+        return
+
+    user_id = str(tg_message.get("from", {}).get("id", ""))
+    if user_id != allowed_user_id:
+        return
+
+    text = tg_message.get("text", "").strip()
+    voice = tg_message.get("voice") or None
+    if not text and voice is None:
+        return
+
+    chat_id = tg_message["chat"]["id"]
+    if not text:
+        print(f"[telegram] {user_id}: [voice]")
+        if stt_client is None:
+            _send_messages(
+                base,
+                chat_id,
+                ["Голосовые пока не понимаю: распознавание речи не настроено."],
+                logger,
+            )
+            return
+    else:
+        print(f"[telegram] {user_id}: {text}")
+
+    command = _command_name(text) if text else ""
+    if command in {"/clear", "/context", "/compact"}:
+        if logger:
+            logger.user(text)
+        try:
+            reply = _context_command_reply(agent, command) or "Неизвестная команда"
+        except Exception as e:
+            reply = f"Ошибка команды {command}: {e}"
+            if logger:
+                logger.error(reply)
+        if logger:
+            logger.agent(reply)
+        _send_messages(base, chat_id, [reply], logger)
+        return
+
+    if command == "/cancel":
+        reply = _cancel_command_reply(agent)
+        work_agent = (work_holder or {}).get("agent")
+        if work_agent is not None and not agent.run_in_progress:
+            work_agent.cancel("команда /cancel")
+            reply = "⏹ Отменяю work-задачу…"
+        _send_messages(base, chat_id, [reply], logger)
+        return
+
+    if command == "/work":
+        task = _work_task(text)
+        if not task:
+            _send_messages(
+                base,
+                chat_id,
+                ["Использование: /work <задача> — долгое выполнение с планом и файлами в work/."],
+                logger,
+            )
+            return
+        if work_agent_factory is None:
+            _send_messages(base, chat_id, ["Work-режим не настроен."], logger)
+            return
+        if not run_lock.acquire(blocking=False):
+            _send_messages(
+                base,
+                chat_id,
+                [
+                    "Я ещё обрабатываю предыдущий запрос. "
+                    "Дождитесь результата или отправьте /cancel."
+                ],
+                logger,
+            )
+            return
+        if logger:
+            logger.user(text)
+
+        def work_worker() -> None:
+            holder = work_holder if work_holder is not None else {}
+            try:
+                work_agent = work_agent_factory()
+                holder["agent"] = work_agent
+                _process_message(work_agent, base, chat_id, task, token, logger)
+                if work_dir and not os.path.exists(os.path.join(work_dir, "report.md")):
+                    _send_messages(
+                        base,
+                        chat_id,
+                        [
+                            f"⚠️ {work_dir}/report.md не создан — исполнитель "
+                            "соблюдал протокол work-режима не полностью."
+                        ],
+                        logger,
+                    )
+            finally:
+                holder.pop("agent", None)
+                run_lock.release()
+
+        threading.Thread(target=work_worker, name="telegram-work", daemon=True).start()
+        return
+
+    if not run_lock.acquire(blocking=False):
+        _send_messages(
+            base,
+            chat_id,
+            [
+                "Я ещё обрабатываю предыдущий запрос. "
+                "Дождитесь результата или отправьте /cancel."
+            ],
+            logger,
+        )
+        return
+
+    # Голосовое логируется после распознавания внутри worker'а.
+    if logger and text:
+        logger.user(text)
+
+    def worker() -> None:
+        try:
+            _process_message(
+                agent,
+                base,
+                chat_id,
+                text,
+                token,
+                logger,
+                voice=voice if not text else None,
+                stt_client=stt_client,
+                stt_model=stt_model,
+            )
+        finally:
+            run_lock.release()
+
+    threading.Thread(target=worker, name="telegram-run", daemon=True).start()
+
+
 def run(
-    agent: Agent, token: str, allowed_user_id: str, logger: SessionLogger | None = None
+    agent: Agent,
+    token: str,
+    allowed_user_id: str,
+    logger: SessionLogger | None = None,
+    stt_client=None,
+    stt_model: str = "",
+    work_agent_factory=None,
+    work_dir: str = "",
 ) -> None:
     base = f"https://api.telegram.org/bot{token}"
+    run_lock = threading.Lock()
+    work_holder: dict = {}
 
     # Пропускаем накопленные сообщения — обрабатываем только новые
     try:
@@ -309,7 +586,7 @@ def run(
             )
             updates = resp.json().get("result", [])
         except Exception as e:
-            err = f"Ошибка polling: {e}"
+            err = f"Ошибка polling: {str(e).replace(base, '<telegram api>')}"
             print(f"[telegram] {err}")
             if logger:
                 logger.error(err)
@@ -318,68 +595,17 @@ def run(
 
         for update in updates:
             offset = update["update_id"] + 1
-
-            tg_message = update.get("message")
-            if not tg_message:
-                continue
-
-            user_id = str(tg_message.get("from", {}).get("id", ""))
-            if user_id != allowed_user_id:
-                continue
-
-            text = tg_message.get("text", "").strip()
-            if not text:
-                continue
-
-            chat_id = tg_message["chat"]["id"]
-            print(f"[telegram] {user_id}: {text}")
-
-            command = _command_name(text)
-            if command in {"/clear", "/context", "/compact"}:
-                if logger:
-                    logger.user(text)
-                try:
-                    reply = _context_command_reply(agent, command) or "Неизвестная команда"
-                except Exception as e:
-                    reply = f"Ошибка команды {command}: {e}"
-                    if logger:
-                        logger.error(reply)
-                if logger:
-                    logger.agent(reply)
-                _send_messages(base, chat_id, [reply], logger)
-                continue
-
-            try:
-                tool_calls: list[tuple[str, str, str]] = []
-                status_message_id = _send_message(
-                    base,
-                    chat_id,
-                    _progress_message(tool_calls),
-                    logger,
-                )
-
-                def on_tool_call(name: str, arguments: str, result: str) -> None:
-                    tool_calls.append((name, arguments, result))
-                    if status_message_id is not None:
-                        _edit_message(
-                            base,
-                            chat_id,
-                            status_message_id,
-                            _progress_message(tool_calls, secret=token),
-                            logger,
-                        )
-
-                reply = _markdown_to_telegram_html(agent.run_turn(text, on_tool_call=on_tool_call))
-                reply += _model_badge(agent)
-                if agent.last_search_query:
-                    url = f"https://duckduckgo.com/?q={quote_plus(agent.last_search_query)}"
-                    query = escape(agent.last_search_query)
-                    reply += f'\n\n<i>🔍 <a href="{url}">{query}</a></i>'
-                outgoing = _messages_with_tool_trace(reply, tool_calls, secret=token)
-            except Exception as e:
-                reply = f"Внутренняя ошибка агента: {e}"
-                outgoing = [reply]
-                if logger:
-                    logger.error(reply)
-
-            _deliver_final(base, chat_id, status_message_id, outgoing, logger)
+            _handle_update(
+                agent,
+                update,
+                base,
+                token,
+                allowed_user_id,
+                run_lock,
+                logger,
+                stt_client=stt_client,
+                stt_model=stt_model,
+                work_agent_factory=work_agent_factory,
+                work_holder=work_holder,
+                work_dir=work_dir,
+            )
