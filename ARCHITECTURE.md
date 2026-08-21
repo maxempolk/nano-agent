@@ -1,290 +1,200 @@
-# Архитектура проекта llm-agent
+# Архитектура Nano Agent
 
 ## Обзор
 
-LLM-агент с поддержкой нескольких интерфейсов (CLI, Telegram), инструментов (web search, bash, cron), и маршрутизацией между локальной Apple AFM и облачной Apple PCC.
+Компактный local-first агент для Apple Intelligence: один agent loop,
+маршрутизация между локальной AFM и Apple PCC, небольшой набор инструментов
+(web search, безопасный bash, cron) и строгие ограничения выполнения
+(бюджет, отмена, политика). Интерфейсы: CLI и Telegram.
 
 ## Структура проекта
 
 ```
-llm-agent/
-├── main.py                  # Точка входа: конфигурация, инициализация Agent, диспетчеризация интерфейсов
+nano-agent/
+├── main.py                  # Точка входа: валидация конфигурации, сборка
+│                            # политики/реестра/агента, диспетчеризация интерфейсов
 ├── core/
-│   ├── agent.py             # Agent class — LLM loop, вызовы инструментов, история сообщений
-│   ├── config.py            # Конфигурация моделей и URL из переменных окружения
-│   ├── llm.py               # Обёртка над OpenAI API для вызова LLM
-│   ├── logger.py            # SessionLogger для логирования сессий в файлы
-│   ├── model_router.py      # Маршрутизация между локальной и PCC моделями
-│   ├── prompts.py           # Системные промпты (FULL, MINI профили)
-│   ├── cron_runner.py       # APScheduler для выполнения отложенных задач
+│   ├── agent.py             # Agent: единый цикл, бюджет, отмена, события
+│   ├── config.py            # Типизированная конфигурация (Pydantic) + валидация
+│   ├── budget.py            # RunBudget: лимиты одного пользовательского запроса
+│   ├── cancellation.py      # CancellationToken: сквозная отмена выполнения
+│   ├── events.py            # Типизированные progress-события + EventBus
+│   ├── policy.py            # ExecutionPolicy: capabilities, workspace, approval
+│   ├── llm.py               # Обёртка над OpenAI-совместимым API
+│   ├── logger.py            # SessionLogger (файловые логи сессий)
+│   ├── model_router.py      # Маршрутизация local/PCC (hybrid)
+│   ├── prompts.py           # Профили промптов (mini, full)
+│   ├── cron_runner.py       # APScheduler: отложенные задачи, отмена, stop()
 │   └── tools/
-│       ├── web_search.py    # WebSearchTool — поиск в DuckDuckGo + извлечение контента через Crawl4AI
-│       ├── bash.py          # execute_bash — выполнение shell-команд
-│       └── cron.py          # cron_manage — управление отложенными задачами
+│       ├── base.py          # Единый протокол: Tool, ToolResult, ToolRegistry
+│       ├── web_search.py    # Evidence-driven поиск + адаптер WebSearchToolSpec
+│       ├── bash.py          # BashTool: безопасное выполнение команд
+│       └── cron.py          # CronManageTool: управление расписанием
 ├── interfaces/
-│   ├── cli.py               # Терминальный интерфейс (stdin/stdout)
-│   └── telegram.py          # Telegram long-polling интерфейс
-├── tests/                   # Unit-тесты
-├── benchmarks/              # Оценка качества моделей
+│   ├── cli.py               # CLI: события, Ctrl+C-отмена
+│   └── telegram.py          # Telegram: события, /cancel, worker-тред
+├── tests/                   # Unit-тесты (287)
+├── benchmarks/              # Оценка локальных моделей на агентных задачах
 ├── logs/                    # Логи сессий
 └── .env                     # Переменные окружения (не в git)
 ```
 
-## Ключевые компоненты
+## Единый протокол инструментов (`core/tools/base.py`)
 
-### Agent (`core/agent.py`)
+Каждый инструмент — класс `Tool` с типизированным контрактом:
 
-Центральный класс, интерфейсно-независимый. Принимает `user_input`, возвращает `reply`.
+- `name`, `description` — идентификатор и описание для модели;
+- `input_model` — Pydantic-схема аргументов (из неё генерируется
+  OpenAI function schema);
+- `capabilities` — требуемые разрешения (`core.policy.Capability`);
+- `timeout`, `output_limit` — ограничения;
+- `execute(args, ctx) -> ToolResult`.
 
-**Основные методы:**
-- `run_turn(user_input, on_tool_call=None)` — основной цикл обработки запроса
-- `_select_route(user_input)` — выбор модели через роутер
-- `_compact_if_needed()` — сжатие контекста при превышении лимита
-- `_finalize_research()` — финальная генерация ответа после поиска
+`ToolResult` разделяет:
 
-**Управление контекстом:**
-- `token_budget` — максимальный размер контекста
-- `compact_trigger_ratio` — порог срабатывания сжатия (0.8 = 80%)
-- `_shrink_tool_results()` — сжатие старых tool-результатов
-- `memory` — сжатая история предыдущих сообщений
+- `content` — содержимое для модели;
+- `summary` — краткое описание для интерфейсов;
+- `error` + `error_code` + `retryable` — структурированные ошибки;
+- `warnings`, `files_created`, `structured`, `meta` — дополнения.
 
-**Инструменты:**
-- `tools` — список схем инструментов (OpenAI function calling format)
-- `handlers` — словарь `{имя: функция}` для вызова инструментов
-- `tool_objects` — словарь `{имя: объект инструмента}` для доступа к состоянию
+`ToolRegistry` — единственный источник инструментов для агента:
 
-### WebSearchTool (`core/tools/web_search.py`)
+- аргументы валидируются Pydantic-схемой ДО выполнения; невалидный вызов
+  не исполняется;
+- политика проверяется ДО выполнения;
+- таймаут инструмента контролируется реестром (backstop), отмена
+  пробрасывается через `ToolContext`;
+- модель может выполнить только инструмент, переданный в текущем
+  LLM-запросе (агент отслеживает `allowed_names` на каждый запрос).
 
-Многоуровневая система веб-поиска с верификацией фактов.
+## Agent (`core/agent.py`)
 
-**Режимы поиска:**
-- `quick` — быстрый поиск по сниппетам DuckDuckGo (0 LLM-вызовов)
-- `normal` — поиск + извлечение контента со 2 источников (3 LLM-вызова)
-- `deep` — глубокий анализ до 5 источников (8 LLM-вызовов)
+Один цикл на запрос. Гарантии:
 
-**Архитектура:**
-1. **Планирование** (`_plan_research`) — LLM определяет аспекты и запросы
-2. **Поиск** (`_search`, `_search_many`) — DuckDuckGo через библиотеку `ddgs`
-3. **Ранжирование** (`_rank_results`) — оценка релевантности результатов
-4. **Извлечение** (`_scrape`) — загрузка и парсинг контента через Crawl4AI
-5. **Верификация** (`_extract_normal_page`, `_synthesize_deep`) — LLM проверяет факты
-6. **Финализация** (`_finalize_research` в Agent) — итоговый ответ на основе evidence
+- **Бюджет**: `RunBudget` ограничивает шаги, вызовы модели, вызовы
+  инструментов, суммарное время, размер tool-вывода, число ошибок подряд
+  и повторы идентичного вызова. Превышение возвращает честное сообщение
+  («Остановлено: … запрос не завершён»), а не правдоподобный ответ.
+- **Отмена**: `CancellationToken` на каждый запуск; `agent.cancel()`
+  прерывает цикл, инструменты и финализацию; история сообщений
+  балансируется (незакрытые tool_calls получают ответ), чтобы контекст
+  оставался валидным для API.
+- **События**: `EventBus` рассылает `run_started`, `route_selected`,
+  `model_started/completed`, `tool_started/completed`,
+  `context_compacted`, `run_completed/failed/cancelled`. CLI и Telegram
+  используют один API; события маленькие и не содержат секретов.
+- **Финализация**: ответ никогда не пустой; JSON и tool-вызовы не
+  выдаются за ответ; частичное исследование явно называется частичным;
+  язык ответа соответствует языку вопроса.
 
-**Извлечение контента:**
-- PDF: `pdftotext` (системная утилита)
-- HTML: Crawl4AI (async, headless Chromium)
-- Fallback: текст сниппета из поиска
+**Контекст:** последние сообщения + summary старой истории
+(`memory`), сжатие при 80% бюджета, уменьшение старых tool-результатов.
+`/clear`, `/context`, `/compact`.
 
-**Бюджет и ограничения:**
-- `SearchBudget` — контроль LLM-вызовов и таймаутов
-- `MAX_RESULTS` — лимит результатов поиска (10)
-- `PAGE_CONTEXT_CHARS` — лимит символов на страницу (7000)
+## Безопасный bash (`core/tools/bash.py`)
 
-### Model Router (`core/model_router.py`)
+- Явная рабочая директория (`BASH_WORKSPACE`), в ней же запускается
+  процесс (`cwd=workspace`).
+- Запись/удаление только внутри workspace (или scratch `/tmp`,
+  `/var/folders`); статический анализ путей в команде.
+- Таймаут с убийством всей группы процессов (`start_new_session` +
+  `killpg`); отмена тоже убивает дочерние процессы.
+- Фильтрация секретов из окружения (`*TOKEN*`, `*SECRET*`,
+  `TELEGRAM_BOT_TOKEN`, …).
+- Запрет интерактивных программ (vim, top, ssh, «голый» python/bash …)
+  и фоновых процессов (`&`, `nohup`, `disown`).
+- Ограничение stdout/stderr (`BASH_OUTPUT_LIMIT`).
+- Классификация команд: `read_only` / `mutating` / `destructive` /
+  `interactive` / `blocked`; деструктивные команды по умолчанию
+  отклоняются (`ALLOW_DESTRUCTIVE=false`) либо требуют подтверждения
+  (`BASH_APPROVAL=prompt`).
+- Отправка данных наружу (curl POST и т.п.) контролируется политикой;
+  при включённом Telegram разрешён только `api.telegram.org`.
+- Structured errors с кодами (`denied`, `timeout`, `command_failed`, …).
 
-Маршрутизация запросов между локальной AFM и облачной PCC.
+## Политика (`core/policy.py`)
 
-**Режимы:**
-- `local` — только локальная модель (AFM Core 3)
-- `pcc` — только облачная модель (Apple PCC)
-- `hybrid` — автоматический выбор по сложности запроса
+Компактный слой, независимый от модели. Capabilities:
+`filesystem.read/write`, `shell.read/write`, `network.read`,
+`external.send`, `scheduler.write`, `destructive`.
 
-**Критерии выбора PCC:**
-- Длина запроса (>450 символов)
-- Наличие блоков кода
-- Ключевые слова (реализация, анализ, рефакторинг и т.д.)
-- Многошаговые инструкции
+Политика по умолчанию: чтение разрешено; изменения — только внутри
+workspace; сетевое чтение разрешено; внешняя отправка контролируется;
+деструктивные действия отклоняются или требуют подтверждения.
 
-### Интерфейсы
+## Бюджет запроса (`core/budget.py`)
 
-**CLI (`interfaces/cli.py`):**
-- Простой цикл `input() -> agent.run_turn() -> print()`
-- Вывод tool calls и результатов
+| Лимит | Переменная | По умолчанию |
+|---|---|---|
+| Шаги агента | `RUN_MAX_STEPS` | 8 |
+| Вызовы модели | `RUN_MAX_MODEL_CALLS` | 12 |
+| Вызовы инструментов | `RUN_MAX_TOOL_CALLS` | 12 |
+| Время выполнения | `RUN_MAX_SECONDS` | 180 |
+| Размер tool-вывода | `RUN_MAX_TOOL_OUTPUT_CHARS` | 2000 |
+| Ошибки подряд | `RUN_MAX_CONSECUTIVE_ERRORS` | 3 |
+| Повторы идентичного вызова | `RUN_MAX_IDENTICAL_CALLS` | 2 |
 
-**Telegram (`interfaces/telegram.py`):**
-- Long-polling через `getUpdates`
-- Фильтрация по `ALLOWED_USER_ID`
-- Прогресс-сообщения с обновлением
-- Поддержка команд: `/clear`, `/context`, `/compact`
-- Markdown -> HTML конвертация
+Web search сохраняет собственные режимные бюджеты (quick/normal/deep);
+RunBudget ограничивает весь ход сверху.
 
-### Cron Runner (`core/cron_runner.py`)
+## Web-исследование (`core/tools/web_search.py`)
 
-Планировщик отложенных задач на APScheduler.
+Режимы `quick` (сниппеты, 0 LLM-вызовов), `normal` (до 2 источников,
+3 вызова), `deep` (до 5 источников, один цикл верификации). Аспект-ориентированный
+план, ранжирование источников, извлечение фактов локальной моделью,
+верификация PCC, детерминированный fallback. Отмена пробрасывается в
+`SearchBudget` через `CancellationToken`.
 
-**Типы задач:**
-- `once` — одноразовые (`run_at` или `run_in`)
-- `cron` — повторяющиеся (cron-выражение)
+## Маршрутизация (`core/model_router.py`)
 
-**Механизм:**
-- `jobs.json` — персистентное хранение задач
-- `_reload_jobs()` — синхронизация файла с планировщиком каждые 30 сек
-- Результат доставляется в Telegram
+`hybrid` — оценка сложности (длина, код, многошаговость, ключевые слова);
+`local`/`pcc` — принудительные режимы. Принудительный режим не считается
+«простым запросом»: инструменты и полный системный промпт остаются
+доступными (`automatic=False`).
 
-## Поток данных
+## Конфигурация (`core/config.py`)
 
-### Простой запрос
+`load_config()` собирает ВСЕ проблемы (неверные enum, диапазоны,
+отсутствующие credentials, несовместимые alias'ы моделей) и сообщает их
+одним списком при старте. См. `.env.example`.
 
-```
-User Input -> Agent.run_turn()
-           -> route_selector() -> выбор модели
-           -> LLM вызов (с tools)
-           -> execute_bash или прямой ответ
-           -> Response
-```
+## Интерфейсы
 
-### Запрос с поиском
+**CLI** — события печатаются как прогресс; первый Ctrl+C отменяет
+текущий запрос, второй — выход.
 
-```
-User Input (с "загугли" или changing fact)
-         -> Agent.run_turn()
-         -> _forced_web_search_query() -> определение запроса
-         -> web_search.execute()
-            -> _plan_research() -> LLM планирует
-            -> _search() -> DuckDuckGo
-            -> _rank_results() -> ранжирование
-            -> _scrape() -> Crawl4AI извлекает контент
-            -> _extract_normal_page() -> LLM извлекает факты
-            -> _synthesize_deep() -> LLM верифицирует
-         -> _finalize_research() -> итоговый ответ
-         -> Response
-```
+**Telegram** — каждый запрос выполняется в worker-треде, поэтому polling
+остаётся отзывчивым: `/cancel` отменяет активный запуск, повторный запрос
+во время выполнения получает busy-сообщение. Прогресс — компактный список
+завершённых инструментов; полный tool-trace — в финальном сообщении.
 
-### Отложенная задача
+## Cron (`core/cron_runner.py`)
 
-```
-User: "напомни через час"
-    -> cron_manage(action="add", run_in=3600)
-    -> jobs.json обновлён
-    -> CronRunner._reload_jobs() добавляет в APScheduler
-    -> (через час) _run_job()
-        -> agent_factory() -> новый Agent
-        -> agent.run_turn(prompt)
-        -> _send_telegram() -> результат в чат
-```
-
-## Конфигурация
-
-### Переменные окружения (`.env`)
-
-| Переменная | Описание | По умолчанию |
-|------------|----------|--------------|
-| `LLM_BASE_URL` | URL OpenAI-совместимого API | `http://127.0.0.1:1976/v1` |
-| `LOCAL_MODEL` | Имя локальной модели | `system` |
-| `PCC_MODEL` | Имя PCC модели | `pcc` |
-| `TELEGRAM_BOT_TOKEN` | Токен Telegram бота | — |
-| `ALLOWED_USER_ID` | Разрешённый user_id | — |
-| `MODEL_MODE` | Режим маршрутизации | `hybrid` |
-| `LOCAL_CONTEXT_TOKEN_BUDGET` | Лимит контекста local | `3000` |
-| `PCC_CONTEXT_TOKEN_BUDGET` | Лимит контекста PCC | `12000` |
-| `COMPACT_TRIGGER_RATIO` | Порог сжатия контекста | `0.8` |
-| `WEB_SEARCH_FORCE_DEPTH` | Фиксированная глубина поиска | `auto` |
-| `PROMPT_PROFILE` | Профиль промптов (full/mini) | — |
-
-### CLI параметры
-
-```bash
-python main.py --cli           # терминальный интерфейс
-python main.py --telegram      # Telegram бот
-python main.py --model hybrid  # режим маршрутизации
-python main.py --local         # только локальная модель
-python main.py --server        # только PCC
-python main.py --prompts mini  # профиль промптов
-```
-
-## Зависимости
-
-### Основные
-- `openai` — OpenAI-совместимый клиент
-- `ddgs` — DuckDuckGo search
-- `crawl4ai` — извлечение контента из HTML (headless Chromium)
-- `httpx` — HTTP клиент для Telegram API
-- `apscheduler` — планировщик задач
-- `pydantic` — валидация structured output
-- `python-dotenv` — загрузка `.env`
-- `tzlocal` — локальная таймзона
-
-### Системные
-- `pdftotext` — извлечение текста из PDF (опционально)
-
-## Логирование
-
-`SessionLogger` создаёт файл лога на каждую сессию в `logs/`.
-
-**Формат:**
-```
-══════════════════════════════════════════════════════════════
-SESSION  2026-07-21 14:30:00
-══════════════════════════════════════════════════════════════
-[14:30:05] USER
-    Запрос пользователя
-────────────────────────────────────────────────────────────
-[14:30:06] TOOL CALL → web_search
-    {"query": "...", "depth": "auto"}
-[14:30:10] TOOL RESULT
-    Результат инструмента
-────────────────────────────────────────────────────────────
-[14:30:15] AGENT
-    Ответ агента
-══════════════════════════════════════════════════════════════
-```
+Задачи хранятся в `jobs.json` (путь настраивается). Одноразовая задача
+удаляется из файла ДО выполнения. Активные задачи отслеживаются;
+`cancel_job(name)` отменяет выполнение; `stop()` отменяет всё и
+останавливает планировщик. `max_instances=1` защищает от дублей.
 
 ## Расширение
 
-### Добавление нового инструмента
+Новый инструмент:
 
-1. Создать файл в `core/tools/` с `SCHEMA` и `execute()`:
 ```python
-SCHEMA = {
-    "type": "function",
-    "function": {"name": "my_tool", "description": "...", "parameters": {...}},
-}
+class MyInput(BaseModel):
+    param: str
 
+class MyTool(Tool):
+    name = "my_tool"
+    description = "..."
+    input_model = MyInput
+    capabilities = frozenset({Capability.FILESYSTEM_READ})
+    timeout = 10.0
 
-def execute(param1: str, param2: int = 0) -> str:
-    return "result"
+    def execute(self, args: MyInput, ctx: ToolContext) -> ToolResult:
+        return ToolResult(content="result", summary="готово")
 ```
 
-2. Добавить в `main.py`:
-```python
-from core.tools import my_tool
+и регистрация в `main.py`: `ToolRegistry([bash_tool, web_spec, cron_tool, MyTool()])`.
 
-agent = _make_agent(logger, extra_tools=[web_search, cron_wrapper, my_tool])
-```
-
-### Добавление нового интерфейса
-
-Создать модуль с функцией `run(agent)`:
-```python
-from core.agent import Agent
-
-
-def run(agent: Agent) -> None:
-    while True:
-        user_input = get_input()
-        reply = agent.run_turn(user_input)
-        send_output(reply)
-```
-
-## Особенности реализации
-
-### Token Economy
-
-- Системные промпты минимальны (каждое слово стоит токенов)
-- `MAX_TOOL_OUTPUT` ограничивает размер tool-результатов (2000 символов)
-- `COMPRESSED_TOOL_CHARS` сжимает старые tool-результаты (400 символов)
-- `compact()` сжимает историю в `memory` при превышении лимита
-
-### Fallback механизмы
-
-- Если LLM вернул невалидный JSON -> повторная попытка с напоминанием
-- Если tool call невалиден -> сообщение об ошибке в контекст
-- Если поиск не дал результатов -> `insufficient_information` flag
-- Если PCC недоступен -> fallback на local модель
-
-### Безопасность
-
-- Секреты только из `.env`, никогда в коде
-- `ALLOWED_USER_ID` фильтрует Telegram сообщения
-- Деструктивные команды требуют подтверждения
-- Tool output считается untrusted data
+Новый интерфейс: подписаться на `agent.events`, вызывать
+`agent.run_turn(text)`, при необходимости `agent.cancel()`.

@@ -14,15 +14,28 @@ class SessionLogger:
         os.makedirs(log_dir, exist_ok=True)
         filename = datetime.now().strftime("%Y-%m-%d_%H-%M-%S") + ".log"
         self.path = os.path.join(log_dir, filename)
+        self._secrets: set[str] = set()
         self._write(
             f"{SESSION_DIVIDER}\n"
             f"SESSION  {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
             f"{SESSION_DIVIDER}\n"
         )
 
+    def add_secret(self, value: str) -> None:
+        """Register a value that must never reach the log file."""
+        value = (value or "").strip()
+        if value:
+            self._secrets.add(value)
+
+    def _redact(self, text: str) -> str:
+        for secret in self._secrets:
+            if secret in text:
+                text = text.replace(secret, "[скрыто]")
+        return text
+
     def _write(self, text: str) -> None:
         with open(self.path, "a", encoding="utf-8") as f:
-            f.write(text + "\n")
+            f.write(self._redact(text) + "\n")
 
     def _ts(self) -> str:
         return datetime.now().strftime("%H:%M:%S")

@@ -8,12 +8,19 @@ requests, and routes more demanding work to Apple Private Cloud Compute (PCC).
 
 ## Highlights
 
-- Uses bash tools to solve tasks step by step.
-- Provides CLI and Telegram interfaces, including messages, photos and documents.
-- Shows tool calls, arguments and results alongside Telegram responses.
+- Single typed tool protocol: Pydantic input schemas, structured results,
+  capability checks; arguments are validated before anything executes.
+- Safe bash pinned to a workspace: timeouts with process-group kill, secret
+  env filtering, no interactive/background processes, destructive actions
+  denied or approval-gated.
+- Per-request run budget (steps, model calls, tool calls, wall time, output
+  size, repeated errors, identical calls) with honest stop messages.
+- Cancellation end to end: Ctrl+C in CLI, `/cancel` in Telegram; subprocesses
+  and crawls are interrupted, nothing keeps running in the background.
+- One typed progress-event stream shared by CLI and Telegram.
+- Evidence-driven web research with source URLs and validated structures.
+- Routes requests between local AFM and Apple PCC based on task complexity.
 - Maintains conversation context and supports `/clear`, `/context` and `/compact`.
-- Researches the web with source URLs and validated Pydantic structures.
-- Routes requests between local and PCC models based on task complexity.
 
 ## Requirements and Installation
 
@@ -27,15 +34,31 @@ uv sync --all-groups
 
 ## Configuration
 
+All settings are validated at startup; problems are reported together
+before the agent starts. See `.env.example` for the full annotated list.
+
 ```env
 TELEGRAM_BOT_TOKEN=                 # Optional token from @BotFather
-ALLOWED_USER_ID=                    # Optional Telegram user ID allowlist
-MODEL_MODE=hybrid                   # hybrid, local or pcc; auto/server are aliases
+ALLOWED_USER_ID=                    # Required when TELEGRAM_BOT_TOKEN is set
+MODEL_MODE=hybrid                   # hybrid, local, pcc or cloud; auto/server are aliases
 PROMPT_PROFILE=                     # Optional global override: full or mini
 LOCAL_CONTEXT_TOKEN_BUDGET=         # Default: 3000
 PCC_CONTEXT_TOKEN_BUDGET=           # Default: 12000
+CLOUD_BASE_URL=                     # Required for MODEL_MODE=cloud
+CLOUD_API_KEY=                      # Required for MODEL_MODE=cloud
+CLOUD_MODEL=                        # Required for MODEL_MODE=cloud
+STT_MODEL=whisper-large-v3-turbo    # Voice transcription; falls back to CLOUD_* provider
 COMPACT_TRIGGER_RATIO=              # Default: 0.8
 WEB_SEARCH_FORCE_DEPTH=auto         # auto, quick, normal or deep
+
+BASH_WORKSPACE=.                    # bash commands run and write only here
+BASH_APPROVAL=deny                  # deny or prompt (CLI confirmation)
+ALLOW_DESTRUCTIVE=false             # allow rm/kill/etc. behind approval
+
+RUN_MAX_STEPS=8                     # per-request run budget
+RUN_MAX_MODEL_CALLS=12
+RUN_MAX_TOOL_CALLS=12
+RUN_MAX_SECONDS=180
 ```
 
 ## Run
@@ -45,6 +68,7 @@ uv run python main.py --cli                    # Hybrid mode
 uv run python main.py --telegram               # Hybrid mode in Telegram
 uv run python main.py --cli --local            # Local AFM Core 3 only
 uv run python main.py --cli --server           # Apple PCC only
+uv run python main.py --cli --cloud            # Cloud provider only (CLOUD_* env)
 uv run python main.py --cli --model local      # Equivalent to --local
 uv run python main.py --cli --model pcc        # Equivalent to --server
 uv run python main.py --cli --prompts mini     # Use the compact prompt profile
@@ -64,8 +88,10 @@ development or analysis signals. The local `system` model uses the `mini`
 profile, while PCC uses `full`; both share the same conversation history.
 
 `--local` disables PCC, including the planner and fallback. `--server` disables
-the local AFM model. Legacy `auto` and `server` values remain supported as
-aliases for `hybrid` and `pcc`.
+the local AFM model. `--cloud` sends every stage (routing, search, finalization,
+compaction) to one external OpenAI-compatible model configured via `CLOUD_BASE_URL`,
+`CLOUD_API_KEY` and `CLOUD_MODEL`. Legacy `auto` and `server` values remain
+supported as aliases for `hybrid` and `pcc`.
 
 Prompt profiles are defined in `core/prompts.py`. Each profile has dedicated
 instructions for the primary agent, Telegram, planner and cron runner.
@@ -124,12 +150,32 @@ The runner writes raw JSONL responses and an aggregated report to
 `benchmark-results/`, which is excluded from Git. The report includes quality,
 p50/p95 latency, token use, API errors and schema fallbacks.
 
+## Interfaces
+
+- **CLI**: print progress events; the first Ctrl+C cancels the active
+  request, a second Ctrl+C exits.
+- **Telegram**: `/clear`, `/context`, `/compact` manage context and
+  `/cancel` stops the active run. Each request runs in a worker thread, so
+  the bot stays responsive while working. Voice messages are transcribed to
+  text (Whisper via the `STT_*` / `CLOUD_*` provider) and handled like text.
+
 ## Structure
 
 ```text
-main.py                    # Application entry point
-core/agent.py              # Agent orchestration and tool calls
-core/prompts.py            # Configurable system prompt profiles
+main.py                    # Entry point: config validation and wiring
+core/agent.py              # Single agent loop: budget, cancellation, events
+core/tools/base.py         # Tool protocol: Tool, ToolResult, ToolRegistry
+core/tools/bash.py         # Safe workspace-pinned bash
+core/tools/web_search.py   # Evidence-driven web research
+core/tools/cron.py         # Scheduled task management
+core/budget.py             # Per-request run budget
+core/cancellation.py       # Cancellation token
+core/events.py             # Typed progress events
+core/policy.py             # Capability policy layer
+core/config.py             # Typed configuration with startup validation
+core/model_router.py       # AFM/PCC routing
+core/prompts.py            # Prompt profiles (mini, full)
+core/cron_runner.py        # APScheduler runner with cancel/stop
 interfaces/cli.py          # Command-line interface
 interfaces/telegram.py     # Telegram interface
 benchmarks/                # Local-model evaluation suite
