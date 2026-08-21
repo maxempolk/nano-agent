@@ -23,6 +23,9 @@ SCHEMA = {
             "action=add: create a task (requires name, prompt, and one of: schedule, run_at, run_in). "
             "action=list: show all tasks. "
             "action=remove: delete a task by name. "
+            "kind=reminder: for reminders and timers — the prompt text is delivered to the user as-is, "
+            "nothing is executed. kind=task (default): the agent executes the prompt at the scheduled time. "
+            "Use reminder whenever the user asks to remind them of something or set a timer with a text. "
             "For recurring tasks use schedule (cron expression, e.g. '0 9 * * *'). "
             "For one-time tasks use run_at (datetime string, e.g. '2026-06-27 15:30') "
             "OR run_in (seconds from now, e.g. 10 for 'in 10 seconds', 300 for 'in 5 minutes'). "
@@ -47,7 +50,12 @@ SCHEMA = {
                 },
                 "prompt": {
                     "type": "string",
-                    "description": "Task for the agent to execute. Do NOT include curl or Telegram commands — the result will be delivered automatically.",
+                    "description": "For task: work for the agent to execute. For reminder: the exact text to deliver. Do NOT include curl or Telegram commands — the result is delivered automatically.",
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["task", "reminder"],
+                    "description": "task (default): the agent executes the prompt. reminder: the prompt text is delivered as-is without execution.",
                 },
             },
             "required": ["action"],
@@ -75,6 +83,7 @@ def execute(
     run_at: str = "",
     run_in: int = 0,
     prompt: str = "",
+    kind: str = "task",
     jobs_file: str = JOBS_FILE,
 ) -> str:
     with _lock:
@@ -85,15 +94,18 @@ def execute(
                 return "Нет активных задач."
             lines = []
             for j in jobs:
+                tag = " (напоминание)" if j.get("kind") == "reminder" else ""
                 if j.get("type") == "once":
-                    lines.append(f"• {j['name']} [once: {j['run_at']}]: {j['prompt']}")
+                    lines.append(f"• {j['name']}{tag} [once: {j['run_at']}]: {j['prompt']}")
                 else:
-                    lines.append(f"• {j['name']} [cron: {j['schedule']}]: {j['prompt']}")
+                    lines.append(f"• {j['name']}{tag} [cron: {j['schedule']}]: {j['prompt']}")
             return "\n".join(lines)
 
         if action == "add":
             if not name or not prompt:
                 return "Ошибка: для add нужны name и prompt."
+            if kind not in ("task", "reminder"):
+                return "Ошибка: kind должен быть task или reminder."
             if any(j["name"] == name for j in jobs):
                 return f"Ошибка: задача '{name}' уже существует."
 
@@ -101,13 +113,31 @@ def execute(
                 run_at = (datetime.now() + timedelta(seconds=run_in)).strftime("%Y-%m-%d %H:%M:%S")
 
             if run_at and not schedule:
-                jobs.append({"name": name, "type": "once", "run_at": run_at, "prompt": prompt})
+                jobs.append(
+                    {
+                        "name": name,
+                        "type": "once",
+                        "run_at": run_at,
+                        "kind": kind,
+                        "prompt": prompt,
+                    }
+                )
                 _save(jobs, jobs_file)
-                return f"Одноразовая задача '{name}' добавлена [run_at: {run_at}]."
+                label = "Напоминание" if kind == "reminder" else "Одноразовая задача"
+                return f"{label} '{name}' добавлено [run_at: {run_at}]."
             elif schedule:
-                jobs.append({"name": name, "type": "cron", "schedule": schedule, "prompt": prompt})
+                jobs.append(
+                    {
+                        "name": name,
+                        "type": "cron",
+                        "schedule": schedule,
+                        "kind": kind,
+                        "prompt": prompt,
+                    }
+                )
                 _save(jobs, jobs_file)
-                return f"Повторяющаяся задача '{name}' добавлена [{schedule}]."
+                label = "Повторяющееся напоминание" if kind == "reminder" else "Повторяющаяся задача"
+                return f"{label} '{name}' добавлено [{schedule}]."
             else:
                 return "Ошибка: укажите schedule, run_at или run_in."
 
@@ -139,6 +169,7 @@ class CronInput(BaseModel):
     run_at: str = Field(default="", max_length=60)
     run_in: int = Field(default=0, ge=0, le=31_536_000)
     prompt: str = Field(default="", max_length=2000)
+    kind: Literal["task", "reminder"] = "task"
 
 
 class CronManageTool(Tool):
@@ -164,6 +195,7 @@ class CronManageTool(Tool):
             run_at=args.run_at,
             run_in=args.run_in,
             prompt=args.prompt,
+            kind=args.kind,
             jobs_file=self.jobs_file,
         )
         failed = text.startswith("Ошибка") or text.endswith("не найдена.")

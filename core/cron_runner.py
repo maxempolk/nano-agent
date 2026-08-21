@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import html
 from datetime import datetime
 
 import httpx
@@ -19,7 +20,8 @@ def _send_telegram(token: str, chat_id: str, text: str) -> None:
             timeout=10,
         )
     except Exception as e:
-        print(f"[cron] Ошибка отправки в Telegram: {e}")
+        # Тип ошибки вместо сообщения: текст исключения может содержать URL с токеном.
+        print(f"[cron] Ошибка отправки в Telegram: {type(e).__name__}")
 
 
 def _run_job(job: dict, runner: CronRunner, token: str, chat_id: str) -> None:
@@ -29,6 +31,12 @@ def _run_job(job: dict, runner: CronRunner, token: str, chat_id: str) -> None:
     if job.get("type") == "once":
         remove_job(job["name"], runner.jobs_file)
         print(f"[cron] Одноразовая задача '{job['name']}' удалена из jobs.json")
+    if job.get("kind") == "reminder":
+        # Напоминание — готовый текст: доставляем как есть, без вызова модели.
+        text = f"⏰ <b>{html.escape(job['name'])}</b>\n\n{html.escape(job['prompt'])}"
+        _send_telegram(token, chat_id, text)
+        print(f"[cron] Напоминание '{job['name']}' доставлено")
+        return
     agent = None
     try:
         agent = runner.agent_factory()

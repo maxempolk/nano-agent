@@ -85,6 +85,77 @@ class RunJobTests(TestCase):
         self.assertIn("digest", observed["active"])
         self.assertEqual(runner._active, {})
 
+    def test_reminder_is_delivered_as_is_without_agent(self):
+        agent = FakeAgent(reply="модель не должна запускаться")
+        factory_calls: list[int] = []
+
+        def factory():
+            factory_calls.append(1)
+            return agent
+
+        runner = CronRunner(factory, "token", "42", jobs_file=self.jobs_file)
+        job = {
+            "name": "oven",
+            "type": "cron",
+            "schedule": "* * * * *",
+            "kind": "reminder",
+            "prompt": "выключить духовку",
+        }
+
+        with patch("core.cron_runner._send_telegram") as send:
+            _run_job(job, runner, "token", "42")
+
+        self.assertEqual(factory_calls, [])
+        self.assertEqual(agent.prompts, [])
+        send.assert_called_once()
+        self.assertIn("выключить духовку", send.call_args.args[2])
+
+    def test_reminder_text_is_html_escaped(self):
+        runner = self._runner(FakeAgent())
+        job = {
+            "name": "alert",
+            "type": "cron",
+            "schedule": "* * * * *",
+            "kind": "reminder",
+            "prompt": "<b>не жирный</b> & co",
+        }
+
+        with patch("core.cron_runner._send_telegram") as send:
+            _run_job(job, runner, "token", "42")
+
+        payload = send.call_args.args[2]
+        self.assertIn("&lt;b&gt;не жирный&lt;/b&gt; &amp; co", payload)
+        self.assertNotIn("<b>не жирный</b>", payload)
+
+    def test_once_reminder_is_removed_and_delivered(self):
+        with open(self.jobs_file, "w", encoding="utf-8") as f:
+            json.dump(
+                [
+                    {
+                        "name": "oven",
+                        "type": "once",
+                        "run_at": "2026-01-01 10:00",
+                        "kind": "reminder",
+                        "prompt": "выключить духовку",
+                    }
+                ],
+                f,
+            )
+        runner = self._runner(FakeAgent())
+        job = {
+            "name": "oven",
+            "type": "once",
+            "run_at": "2026-01-01 10:00",
+            "kind": "reminder",
+            "prompt": "выключить духовку",
+        }
+
+        with patch("core.cron_runner._send_telegram") as send:
+            _run_job(job, runner, "token", "42")
+
+        self.assertEqual(_load(self.jobs_file), [])
+        self.assertIn("выключить духовку", send.call_args.args[2])
+
 
 class CancelJobTests(TestCase):
     def test_cancel_active_job_calls_agent_cancel(self):

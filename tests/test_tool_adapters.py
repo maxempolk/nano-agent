@@ -149,6 +149,49 @@ class CronToolAdapterTests(TestCase):
         self.assertEqual(stored[0]["name"], "daily")
         self.assertEqual(stored[0]["type"], "cron")
 
+    def test_add_reminder_stores_kind(self):
+        tool = self._tool()
+        result = tool.run(
+            {
+                "action": "add",
+                "name": "oven",
+                "prompt": "выключить духовку",
+                "run_in": 20,
+                "kind": "reminder",
+            },
+            ToolContext(),
+        )
+        self.assertTrue(result.ok, result.error)
+        self.assertIn("Напоминание", result.content)
+        with open(self.jobs_file, encoding="utf-8") as f:
+            stored = json.load(f)
+        self.assertEqual(stored[0]["kind"], "reminder")
+
+    def test_default_kind_is_task(self):
+        tool = self._tool()
+        tool.run({"action": "add", "name": "a", "prompt": "p", "run_in": 5}, ToolContext())
+        with open(self.jobs_file, encoding="utf-8") as f:
+            stored = json.load(f)
+        self.assertEqual(stored[0]["kind"], "task")
+
+    def test_list_marks_reminders(self):
+        tool = self._tool()
+        tool.run(
+            {"action": "add", "name": "oven", "prompt": "выключить духовку", "run_in": 20, "kind": "reminder"},
+            ToolContext(),
+        )
+        listed = tool.run({"action": "list"}, ToolContext())
+        self.assertIn("(напоминание)", listed.content)
+
+    def test_invalid_kind_fails_validation_without_execution(self):
+        tool = self._tool()
+        result = tool.run(
+            {"action": "add", "name": "a", "prompt": "p", "run_in": 5, "kind": "alarm"},
+            ToolContext(),
+        )
+        self.assertEqual(result.error_code, ErrorCode.INVALID_ARGUMENTS)
+        self.assertEqual(_load(self.jobs_file), [])
+
 
 if __name__ == "__main__":
     import unittest
