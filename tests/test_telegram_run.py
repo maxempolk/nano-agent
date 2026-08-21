@@ -9,6 +9,7 @@ from interfaces.telegram import (
     _cancel_command_reply,
     _handle_update,
     _process_message,
+    _transcribe_voice,
 )
 from tests.test_agent_forced_search import FakeBashTool, _completion, _tool_completion
 
@@ -18,6 +19,23 @@ def _update(text: str, user_id: str = "42", chat_id: int = 42, update_id: int = 
         "update_id": update_id,
         "message": {"from": {"id": user_id}, "chat": {"id": chat_id}, "text": text},
     }
+
+
+def _voice_update(user_id: str = "42", chat_id: int = 42, update_id: int = 1) -> dict:
+    return {
+        "update_id": update_id,
+        "message": {
+            "from": {"id": user_id},
+            "chat": {"id": chat_id},
+            "voice": {"file_id": "abc123", "duration": 3, "file_size": 100},
+        },
+    }
+
+
+def _wait_for_unlock(lock: threading.Lock) -> None:
+    deadline = time.monotonic() + 2
+    while lock.locked() and time.monotonic() < deadline:
+        time.sleep(0.01)
 
 
 class CancelCommandTests(TestCase):
@@ -161,6 +179,128 @@ class ProcessMessageTests(TestCase):
 
         for message in deliver.call_args.args[3]:
             self.assertNotIn(secret, message)
+
+
+class VoiceMessageTests(TestCase):
+    def _mock_agent(self) -> Mock:
+        agent = Mock()
+        agent.run_turn.return_value = "готово"
+        agent.model = "model"
+        agent.last_route_name = "cloud"
+        agent.last_search_query = ""
+        return agent
+
+    def test_voice_is_transcribed_and_run_by_agent(self):
+        agent = self._mock_agent()
+        lock = threading.Lock()
+
+        with (
+            patch(
+                "interfaces.telegram._transcribe_voice", return_value="выключить духовку"
+            ) as transcribe,
+            patch("interfaces.telegram._send_message", return_value=1),
+            patch("interfaces.telegram._edit_message", return_value=True),
+            patch("interfaces.telegram._deliver_final"),
+        ):
+            _handle_update(
+                agent,
+                _voice_update(),
+                "base",
+                "tok",
+                "42",
+                lock,
+                stt_client=object(),
+                stt_model="whisper-large-v3-turbo",
+            )
+
+        _wait_for_unlock(lock)
+        transcribe.assert_called_once()
+        self.assertIn("abc123", transcribe.call_args.args)
+        agent.run_turn.assert_called_once_with("выключить духовку")
+
+    def test_voice_without_stt_is_rejected_without_agent_run(self):
+        agent = self._mock_agent()
+        lock = threading.Lock()
+
+        with patch("interfaces.telegram._send_messages") as send:
+            _handle_update(agent, _voice_update(), "base", "tok", "42", lock)
+
+        send.assert_called_once()
+        self.assertIn("не понимаю", send.call_args.args[2][0])
+        agent.run_turn.assert_not_called()
+
+    def test_voice_recognized_as_empty_is_reported(self):
+        agent = self._mock_agent()
+        lock = threading.Lock()
+
+        with (
+            patch("interfaces.telegram._transcribe_voice", return_value="   "),
+            patch("interfaces.telegram._send_message", return_value=1),
+            patch("interfaces.telegram._deliver_final") as deliver,
+        ):
+            _handle_update(
+                agent, _voice_update(), "base", "tok", "42", lock, stt_client=object()
+            )
+
+        _wait_for_unlock(lock)
+        agent.run_turn.assert_not_called()
+        self.assertTrue(
+            any("Не удалось распознать" in message for message in deliver.call_args.args[3])
+        )
+
+    def test_transcription_error_delivers_message_not_exception(self):
+        agent = self._mock_agent()
+
+        with (
+            patch("interfaces.telegram._transcribe_voice", side_effect=RuntimeError("STT лёг")),
+            patch("interfaces.telegram._send_message", return_value=3),
+            patch("interfaces.telegram._deliver_final") as deliver,
+        ):
+            _process_message(
+                agent,
+                "base",
+                42,
+                "",
+                "tok",
+                None,
+                voice={"file_id": "x"},
+                stt_client=object(),
+                stt_model="w",
+            )
+
+        agent.run_turn.assert_not_called()
+        self.assertTrue(
+            any("Не удалось распознать" in message for message in deliver.call_args.args[3])
+        )
+
+
+class TranscribeVoiceTests(TestCase):
+    def test_downloads_file_and_returns_transcription(self):
+        stt = Mock()
+        stt.audio.transcriptions.create.return_value = "  привет  "
+
+        with (
+            patch(
+                "interfaces.telegram._telegram_post",
+                return_value={"ok": True, "result": {"file_path": "voice/file_1.oga"}},
+            ),
+            patch("interfaces.telegram.httpx.get") as get,
+        ):
+            get.return_value.content = b"audio"
+            get.return_value.raise_for_status = Mock()
+            result = _transcribe_voice("base", "tok", "fid", stt, "whisper-large-v3-turbo")
+
+        self.assertEqual(result, "привет")
+        get.assert_called_once()
+        self.assertIn("api.telegram.org/file/bot", get.call_args.args[0])
+        kwargs = stt.audio.transcriptions.create.call_args.kwargs
+        self.assertEqual(kwargs["model"], "whisper-large-v3-turbo")
+        self.assertEqual(kwargs["file"][0], "voice.ogg")
+
+    def test_missing_file_path_raises(self):
+        with patch("interfaces.telegram._telegram_post", return_value=None):
+            with self.assertRaises(RuntimeError):
+                _transcribe_voice("base", "tok", "fid", Mock(), "w")
 
 
 if __name__ == "__main__":

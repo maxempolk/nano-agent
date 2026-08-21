@@ -48,6 +48,11 @@ EXPLICIT_WEB_SEARCH = re.compile(
     r"google it|look it up)\b",
     re.IGNORECASE,
 )
+# «поищи в памяти/заметках» — это про локальное хранилище notes, а не про веб.
+LOCAL_MEMORY_REFERENCE = re.compile(
+    r"\b(в памяти|в заметк\w*|в записк\w*|в notes|мо[ию] память|заметк\w*|notes)\b",
+    re.IGNORECASE,
+)
 GENERIC_SEARCH_FOLLOWUP = re.compile(
     r"^\s*(поищи(?: в сети)?|загугли|проверь в (?:сети|интернете)|"
     r"search online|search the web|google it|look it up)[.!?\s]*$",
@@ -126,6 +131,8 @@ def _truncate(text: str, max_chars: int) -> str:
 
 
 def _forced_web_search_query(user_input: str, previous_user_input: str | None = None) -> str | None:
+    if LOCAL_MEMORY_REFERENCE.search(user_input):
+        return None
     if GENERIC_SEARCH_FOLLOWUP.match(user_input):
         return previous_user_input or user_input
     if (
@@ -298,6 +305,7 @@ class Agent:
         compact_model: str | None = None,
         budget_limits: BudgetLimits | None = None,
         policy: ExecutionPolicy | None = None,
+        memory_lookup: Callable[[str], str] | None = None,
     ):
         self.client = client
         self.model = model
@@ -313,6 +321,7 @@ class Agent:
         self.registry = registry
         self.budget_limits = budget_limits or BudgetLimits()
         self.policy = policy
+        self.memory_lookup = memory_lookup
         self.base_system = system
         self.memory = ""
         self.messages: list = [{"role": "system", "content": self.base_system}]
@@ -325,6 +334,7 @@ class Agent:
         self._turn_system: str | None = None
         self._cancel_token: CancellationToken | None = None
         self._last_web_result = None
+        self._memory_message: dict | None = None
 
     # ------------------------------------------------------------------
     # tool access
@@ -352,6 +362,7 @@ class Agent:
         self.memory = ""
         self.messages = [{"role": "system", "content": self.base_system}]
         self.last_search_query = None
+        self._memory_message = None
         if self.logger:
             self.logger.info("Контекст очищен")
 
@@ -621,6 +632,32 @@ class Agent:
             call_id = call.get("id", "") if isinstance(call, dict) else getattr(call, "id", "")
             self.messages.append({"role": "tool", "tool_call_id": call_id, "content": note})
 
+    def _inject_memory(self, user_input: str) -> None:
+        """Автоматически подставляет сохранённые заметки, подходящие к запросу."""
+        if self.memory_lookup is None:
+            return
+        try:
+            memo = self.memory_lookup(user_input)
+        except Exception as error:  # noqa: BLE001 - память не должна ломать ход
+            if self.logger:
+                self.logger.error(f"memory lookup failed | {type(error).__name__}")
+            return
+        memo = (memo or "").strip()
+        if not memo:
+            return
+        block = {
+            "role": "system",
+            "content": (
+                "Сохранённые заметки (долговременная память), относящиеся к запросу:\n"
+                f"{memo}\n"
+                "Учитывай их в ответе, если они подходят по смыслу."
+            ),
+        }
+        self.messages.append(block)
+        self._memory_message = block
+        if self.logger:
+            self.logger.info(f"memory injected | chars={len(memo)}")
+
     def _run_turn(
         self, user_input: str, budget: RunBudget, token: CancellationToken
     ) -> str:
@@ -643,9 +680,18 @@ class Agent:
             ),
             None,
         )
+        if self._memory_message is not None:
+            # Блок памяти прошлого хода одноразовый: убираем, чтобы он не
+            # копился в истории и не попадал в компакцию.
+            try:
+                self.messages.remove(self._memory_message)
+            except ValueError:
+                pass
+            self._memory_message = None
         self.messages.append({"role": "user", "content": user_input})
         if self.logger:
             self.logger.user(user_input)
+        self._inject_memory(user_input)
 
         ctx = ToolContext(cancel=token, policy=self.policy, logger=self.logger)
         self.last_search_query = None

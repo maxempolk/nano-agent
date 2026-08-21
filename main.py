@@ -19,6 +19,9 @@ from core.prompts import build_prompt_set
 from core.tools.base import ToolRegistry
 from core.tools.bash import BashTool
 from core.tools.cron import CronManageTool
+from core.tools.notes import NotesTool
+from core.tools.notes import execute as notes_execute
+from core.tools.read_url import ReadUrlTool
 from core.tools.web_search import WebSearchTool, WebSearchToolSpec
 
 parser = argparse.ArgumentParser(description="LLM Agent")
@@ -28,8 +31,8 @@ interface.add_argument("--telegram", action="store_true", help="Telegram-инт�
 model_group = parser.add_mutually_exclusive_group()
 model_group.add_argument(
     "--model",
-    choices=("hybrid", "auto", "local", "pcc", "server"),
-    help="маршрутизация Apple-моделей (по умолчанию: hybrid)",
+    choices=("hybrid", "auto", "local", "pcc", "server", "cloud"),
+    help="маршрутизация моделей (по умолчанию: hybrid)",
 )
 model_group.add_argument(
     "--local",
@@ -40,6 +43,11 @@ model_group.add_argument(
     "--server",
     action="store_true",
     help="только Apple PCC, без локальной модели",
+)
+model_group.add_argument(
+    "--cloud",
+    action="store_true",
+    help="только облачная модель (CLOUD_BASE_URL/CLOUD_API_KEY/CLOUD_MODEL)",
 )
 parser.add_argument(
     "--prompts",
@@ -57,6 +65,8 @@ if args.local:
     os.environ["MODEL_MODE"] = "local"
 if args.server:
     os.environ["MODEL_MODE"] = "pcc"
+if args.cloud:
+    os.environ["MODEL_MODE"] = "cloud"
 if args.prompts:
     os.environ["PROMPT_PROFILE"] = args.prompts
 
@@ -90,12 +100,35 @@ def _cli_approval(description: str) -> bool:
 client = OpenAI(
     base_url=config.llm_base_url, api_key="apple-local", timeout=config.llm_timeout
 )
+cloud_client = None
+if config.model_mode == "cloud":
+    cloud_client = OpenAI(
+        base_url=config.cloud_base_url,
+        api_key=config.cloud_api_key,
+        timeout=config.llm_timeout,
+    )
+llm_client = cloud_client if config.model_mode == "cloud" else client
+
+stt_client = None
+if config.stt_api_key and config.stt_base_url:
+    stt_client = OpenAI(
+        base_url=config.stt_base_url,
+        api_key=config.stt_api_key,
+        timeout=config.llm_timeout,
+    )
+
 logger = SessionLogger(config.log_dir)
+logger.add_secret(config.telegram_bot_token)
+logger.add_secret(config.allowed_user_id)
+logger.add_secret(config.cloud_api_key)
+logger.add_secret(config.stt_api_key)
 logger.info(
-    f"mode={mode} | apple={config.model_mode} | "
+    f"mode={mode} | model_mode={config.model_mode} | "
     f"local={config.local_model}/{config.local_prompt_profile.value} | "
     f"pcc={config.pcc_model}/{config.pcc_prompt_profile.value} | "
-    f"context={config.local_context_token_budget}/{config.pcc_context_token_budget} | "
+    f"cloud={config.cloud_model or '-'}/{config.cloud_prompt_profile.value} | "
+    f"context={config.local_context_token_budget}/{config.pcc_context_token_budget}/"
+    f"{config.cloud_context_token_budget} | "
     f"web_search={config.web_search_force_depth.value} | "
     f"workspace={config.bash_workspace}"
 )
@@ -125,20 +158,31 @@ pcc_prompts = build_prompt_set(
     telegram_token=config.telegram_bot_token,
     allowed_user_id=config.allowed_user_id,
 )
+cloud_prompts = build_prompt_set(
+    config.cloud_prompt_profile.value,
+    system_info=_system_info(),
+    telegram_token=config.telegram_bot_token,
+    allowed_user_id=config.allowed_user_id,
+)
 
 # Hybrid: AFM планирует normal и извлекает страницы, PCC планирует/синтезирует deep.
-# Строгие local/server режимы не пересекают выбранную границу.
-search_worker_model = (
-    config.pcc_model if config.model_mode == "pcc" else config.local_model
-)
-search_planner_model = (
-    config.pcc_model if config.model_mode == "pcc" else config.local_model
-)
-search_deep_planner = (
-    config.local_model if config.model_mode == "local" else config.pcc_model
-)
+# Строгие local/server/cloud режимы не пересекают выбранную границу.
+if config.model_mode == "cloud":
+    search_worker_model = config.cloud_model
+    search_planner_model = config.cloud_model
+    search_deep_planner = config.cloud_model
+else:
+    search_worker_model = (
+        config.pcc_model if config.model_mode == "pcc" else config.local_model
+    )
+    search_planner_model = (
+        config.pcc_model if config.model_mode == "pcc" else config.local_model
+    )
+    search_deep_planner = (
+        config.local_model if config.model_mode == "local" else config.pcc_model
+    )
 web_engine = WebSearchTool(
-    client,
+    llm_client,
     search_worker_model,
     model_mini=search_worker_model,
     planner_model=search_planner_model,
@@ -157,7 +201,11 @@ bash_tool = BashTool(
     output_limit=config.bash_output_limit,
 )
 cron_tool = CronManageTool(jobs_file=config.jobs_file)
-registry = ToolRegistry([bash_tool, WebSearchToolSpec(web_engine), cron_tool])
+read_url_tool = ReadUrlTool(web_engine)
+notes_tool = NotesTool(notes_file=config.notes_file)
+registry = ToolRegistry(
+    [bash_tool, WebSearchToolSpec(web_engine), read_url_tool, notes_tool, cron_tool]
+)
 
 
 def _router(*, cron: bool = False) -> AppleModelRouter:
@@ -177,16 +225,39 @@ def _router(*, cron: bool = False) -> AppleModelRouter:
         config.pcc_context_token_budget,
         fallback_model=config.local_model if config.model_mode == "hybrid" else None,
     )
-    return AppleModelRouter(local, pcc, mode=config.model_mode)
+    cloud = None
+    if config.model_mode == "cloud":
+        cloud_system = cloud_prompts.cron_agent if cron else cloud_prompts.agent
+        cloud = ModelRoute(
+            "cloud",
+            config.cloud_model,
+            cloud_system,
+            config.cloud_context_token_budget,
+        )
+    return AppleModelRouter(local, pcc, mode=config.model_mode, cloud=cloud)
+
+
+def _memory_lookup(query: str) -> str:
+    """Авто-вспоминание: заметки по словам запроса, без участия модели."""
+    result = notes_execute(action="search", query=query, notes_file=config.notes_file)
+    if not result or result.startswith("Ничего не найдено") or result.startswith("Ошибка"):
+        return ""
+    lines = result.splitlines()
+    return "\n".join(lines[-3:])
 
 
 def _make_agent(agent_logger, *, cron: bool = False) -> Agent:
     router = _router(cron=cron)
-    initial = router.pcc if config.model_mode == "pcc" else router.local
+    if config.model_mode == "cloud":
+        initial = router.cloud
+    elif config.model_mode == "pcc":
+        initial = router.pcc
+    else:
+        initial = router.local
     # Крон-агент не получает cron_manage, чтобы задачи не создавали задачи рекурсивно.
     tools = registry.without("cron_manage") if cron else registry
     return Agent(
-        client,
+        llm_client,
         initial.model,
         initial.system,
         registry=tools,
@@ -195,19 +266,28 @@ def _make_agent(agent_logger, *, cron: bool = False) -> Agent:
         logger=agent_logger,
         model_fallback=initial.fallback_model,
         token_budget=initial.token_budget,
-        compact_prompt=local_prompts.compact,
+        compact_prompt=(
+            cloud_prompts.compact if config.model_mode == "cloud" else local_prompts.compact
+        ),
         compact_trigger_ratio=config.compact_trigger_ratio,
         route_selector=router.select,
         compact_model=(
-            config.pcc_model if config.model_mode == "pcc" else config.local_model
+            config.cloud_model
+            if config.model_mode == "cloud"
+            else config.pcc_model
+            if config.model_mode == "pcc"
+            else config.local_model
         ),
         budget_limits=config.budget,
         policy=policy,
+        memory_lookup=_memory_lookup,
     )
 
 
 def cron_agent_factory():
     cron_logger = SessionLogger(config.log_dir)
+    cron_logger.add_secret(config.telegram_bot_token)
+    cron_logger.add_secret(config.allowed_user_id)
     cron_logger.info(f"mode=cron | apple={config.model_mode}")
     return _make_agent(cron_logger, cron=True)
 
@@ -229,7 +309,14 @@ try:
     if mode == "telegram":
         from interfaces.telegram import run
 
-        run(agent, config.telegram_bot_token, config.allowed_user_id, logger=logger)
+        run(
+            agent,
+            config.telegram_bot_token,
+            config.allowed_user_id,
+            logger=logger,
+            stt_client=stt_client,
+            stt_model=config.stt_model,
+        )
     else:
         from interfaces.cli import run
 

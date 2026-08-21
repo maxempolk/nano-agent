@@ -14,6 +14,7 @@ class Capability(str, Enum):
     NETWORK_READ = "network.read"
     EXTERNAL_SEND = "external.send"
     SCHEDULER_WRITE = "scheduler.write"
+    NOTES_WRITE = "notes.write"
     DESTRUCTIVE = "destructive"
 
 

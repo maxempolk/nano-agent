@@ -7,6 +7,7 @@ class AppleModelRouterTests(TestCase):
     def setUp(self):
         self.local = ModelRoute("local", "system", "MINI", 3000, "pcc")
         self.pcc = ModelRoute("pcc", "pcc", "FULL", 12000, "system")
+        self.cloud = ModelRoute("cloud", "qwen-plus", "FULL", 12000)
 
     def test_simple_request_stays_local(self):
         decision = AppleModelRouter(self.local, self.pcc).select("Привет, как дела?")
@@ -72,3 +73,28 @@ class AppleModelRouterTests(TestCase):
         self.assertEqual(router.mode, "pcc")
         self.assertEqual(decision.route.model, "pcc")
         self.assertIsNone(decision.route.fallback_model)
+
+    def test_cloud_mode_always_selects_cloud_route(self):
+        router = AppleModelRouter(self.local, self.pcc, "cloud", cloud=self.cloud)
+
+        decision = router.select("Привет")
+
+        self.assertEqual(router.mode, "cloud")
+        self.assertEqual(decision.route.model, "qwen-plus")
+        self.assertEqual(decision.reason, "forced cloud mode")
+        self.assertFalse(decision.automatic)
+
+    def test_cloud_mode_overrides_heuristics(self):
+        router = AppleModelRouter(self.local, self.pcc, "cloud", cloud=self.cloud)
+
+        decision = router.select("Проанализируй логи и исправь архитектуру агента")
+
+        self.assertEqual(decision.route, self.cloud)
+
+    def test_cloud_mode_requires_cloud_route(self):
+        with self.assertRaises(ValueError):
+            AppleModelRouter(self.local, self.pcc, "cloud")
+
+    def test_resolve_model_mode_accepts_cloud(self):
+        self.assertEqual(resolve_model_mode(cli_model="cloud"), "cloud")
+        self.assertEqual(resolve_model_mode(env_mode="cloud"), "cloud")

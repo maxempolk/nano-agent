@@ -215,11 +215,37 @@ def _telegram_post(
             logger.info(f"Telegram {method} ok | message_id={message_id}")
         return payload
     except Exception as error:
-        err = f"Telegram {method}: {error}"
+        # base содержит токен бота — не даём ему попасть в ошибки/логи
+        err = f"Telegram {method}: {str(error).replace(base, '<telegram api>')}"
         print(f"[telegram] {err}")
         if logger:
             logger.error(err)
         return None
+
+
+def _transcribe_voice(base: str, token: str, file_id: str, stt_client, stt_model: str) -> str:
+    """Скачивает голосовое из Telegram и распознаёт его в текст через STT-API."""
+    payload = _telegram_post(base, "getFile", {"file_id": file_id})
+    file_path = (payload or {}).get("result", {}).get("file_path") if payload else None
+    if not file_path:
+        raise RuntimeError("Telegram не отдал файл голосового")
+
+    file_base = f"https://api.telegram.org/file/bot{token}"
+    try:
+        response = httpx.get(f"{file_base}/{file_path}", timeout=60)
+        response.raise_for_status()
+        audio = response.content
+    except Exception as error:
+        raise RuntimeError(f"не удалось скачать аудио: {type(error).__name__}") from None
+
+    result = stt_client.audio.transcriptions.create(
+        model=stt_model,
+        # Telegram отдаёт голосовые в контейнере .oga (Ogg Opus); Groq
+        # принимает только .ogg/.opus из этого семейства.
+        file=("voice.ogg", audio),
+        response_format="text",
+    )
+    return str(result).strip()
 
 
 def _send_message(
@@ -292,12 +318,38 @@ def _process_message(
     text: str,
     token: str,
     logger: SessionLogger | None,
+    voice: dict | None = None,
+    stt_client=None,
+    stt_model: str = "",
 ) -> None:
     """Run one agent turn and deliver the result. Executed in a worker
     thread so polling stays responsive and /cancel can reach the run."""
     tool_calls: list[tuple[str, str, str]] = []
     pending_args: dict[str, str] = {}
-    status_message_id = _send_message(base, chat_id, _progress_message([]), logger)
+
+    if voice is not None:
+        status_message_id = _send_message(
+            base, chat_id, "🎤 <b>Распознаю голосовое…</b>", logger
+        )
+        try:
+            text = _transcribe_voice(
+                base, token, voice.get("file_id", ""), stt_client, stt_model
+            ).strip()
+        except Exception as error:  # noqa: BLE001 - voice input must not kill the run
+            err = f"Ошибка распознавания голоса: {type(error).__name__}: {str(error)[:200]}"
+            if logger:
+                logger.error(err)
+            _deliver_final(base, chat_id, status_message_id, ["Не удалось распознать голосовое."], logger)
+            return
+        if not text:
+            _deliver_final(base, chat_id, status_message_id, ["Не удалось распознать голосовое."], logger)
+            return
+        if logger:
+            logger.user(f"[voice] {text}")
+        if status_message_id is not None:
+            _edit_message(base, chat_id, status_message_id, _progress_message([]), logger)
+    else:
+        status_message_id = _send_message(base, chat_id, _progress_message([]), logger)
 
     def listener(event: AgentEvent) -> None:
         if isinstance(event, ToolStarted):
@@ -350,6 +402,8 @@ def _handle_update(
     allowed_user_id: str,
     run_lock: threading.Lock,
     logger: SessionLogger | None = None,
+    stt_client=None,
+    stt_model: str = "",
 ) -> None:
     tg_message = update.get("message")
     if not tg_message:
@@ -360,13 +414,25 @@ def _handle_update(
         return
 
     text = tg_message.get("text", "").strip()
-    if not text:
+    voice = tg_message.get("voice") or None
+    if not text and voice is None:
         return
 
     chat_id = tg_message["chat"]["id"]
-    print(f"[telegram] {user_id}: {text}")
+    if not text:
+        print(f"[telegram] {user_id}: [voice]")
+        if stt_client is None:
+            _send_messages(
+                base,
+                chat_id,
+                ["Голосовые пока не понимаю: распознавание речи не настроено."],
+                logger,
+            )
+            return
+    else:
+        print(f"[telegram] {user_id}: {text}")
 
-    command = _command_name(text)
+    command = _command_name(text) if text else ""
     if command in {"/clear", "/context", "/compact"}:
         if logger:
             logger.user(text)
@@ -397,12 +463,23 @@ def _handle_update(
         )
         return
 
-    if logger:
+    # Голосовое логируется после распознавания внутри worker'а.
+    if logger and text:
         logger.user(text)
 
     def worker() -> None:
         try:
-            _process_message(agent, base, chat_id, text, token, logger)
+            _process_message(
+                agent,
+                base,
+                chat_id,
+                text,
+                token,
+                logger,
+                voice=voice if not text else None,
+                stt_client=stt_client,
+                stt_model=stt_model,
+            )
         finally:
             run_lock.release()
 
@@ -410,7 +487,12 @@ def _handle_update(
 
 
 def run(
-    agent: Agent, token: str, allowed_user_id: str, logger: SessionLogger | None = None
+    agent: Agent,
+    token: str,
+    allowed_user_id: str,
+    logger: SessionLogger | None = None,
+    stt_client=None,
+    stt_model: str = "",
 ) -> None:
     base = f"https://api.telegram.org/bot{token}"
     run_lock = threading.Lock()
@@ -436,7 +518,7 @@ def run(
             )
             updates = resp.json().get("result", [])
         except Exception as e:
-            err = f"Ошибка polling: {e}"
+            err = f"Ошибка polling: {str(e).replace(base, '<telegram api>')}"
             print(f"[telegram] {err}")
             if logger:
                 logger.error(err)
@@ -445,4 +527,14 @@ def run(
 
         for update in updates:
             offset = update["update_id"] + 1
-            _handle_update(agent, update, base, token, allowed_user_id, run_lock, logger)
+            _handle_update(
+                agent,
+                update,
+                base,
+                token,
+                allowed_user_id,
+                run_lock,
+                logger,
+                stt_client=stt_client,
+                stt_model=stt_model,
+            )

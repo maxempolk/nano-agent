@@ -842,6 +842,10 @@ class WebSearchTool:
             text = self._scrape_crawl4ai(url) or text
         return text or "Не удалось извлечь текст."
 
+    def read_page(self, url: str) -> str:
+        """Публичная точка входа в скрейпер: чтение конкретной страницы/PDF."""
+        return self._scrape(url)
+
     def _search(self, query: str) -> list[dict]:
         started = time.monotonic()
         last_error: Exception | None = None

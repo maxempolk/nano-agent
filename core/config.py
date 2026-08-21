@@ -47,6 +47,18 @@ class AppConfig(BaseModel):
     pcc_model: str = "pcc"
     model_mode: str = "hybrid"
 
+    # Cloud OpenAI-compatible provider (model_mode=cloud)
+    cloud_base_url: str = ""
+    cloud_api_key: str = ""
+    cloud_model: str = ""
+    cloud_prompt_profile: PromptProfileName = PromptProfileName.FULL
+    cloud_context_token_budget: int = Field(default=12000, ge=500, le=200_000)
+
+    # Speech-to-text for Telegram voice messages (falls back to CLOUD_* provider)
+    stt_base_url: str = ""
+    stt_api_key: str = ""
+    stt_model: str = "whisper-large-v3-turbo"
+
     # Prompt profiles
     local_prompt_profile: PromptProfileName = PromptProfileName.MINI
     pcc_prompt_profile: PromptProfileName = PromptProfileName.FULL
@@ -77,6 +89,7 @@ class AppConfig(BaseModel):
 
     # Scheduler / state
     jobs_file: str = "jobs.json"
+    notes_file: str = "notes.json"
     log_dir: str = "logs"
 
     # Per-request run budget
@@ -138,12 +151,18 @@ def load_config(
     values["llm_base_url"] = _env_str(env, "LLM_BASE_URL", "http://127.0.0.1:1976/v1")
     values["local_model"] = _env_str(env, "LOCAL_MODEL", "system")
     values["pcc_model"] = _env_str(env, "PCC_MODEL", "pcc")
+    values["cloud_base_url"] = _env_str(env, "CLOUD_BASE_URL")
+    values["cloud_api_key"] = _env_str(env, "CLOUD_API_KEY")
+    values["cloud_model"] = _env_str(env, "CLOUD_MODEL")
+    values["stt_base_url"] = _env_str(env, "STT_BASE_URL") or values["cloud_base_url"]
+    values["stt_api_key"] = _env_str(env, "STT_API_KEY") or values["cloud_api_key"]
+    values["stt_model"] = _env_str(env, "STT_MODEL", "whisper-large-v3-turbo")
 
     try:
         values["model_mode"] = resolve_model_mode(env_mode=env.get("MODEL_MODE") or None)
     except ValueError:
         problems.append(
-            f"MODEL_MODE должен быть hybrid, local или pcc, получено '{env.get('MODEL_MODE')}'"
+            f"MODEL_MODE должен быть hybrid, local, pcc или cloud, получено '{env.get('MODEL_MODE')}'"
         )
         values["model_mode"] = "hybrid"
 
@@ -151,6 +170,7 @@ def load_config(
     for key, env_name, default in (
         ("local_prompt_profile", "LOCAL_PROMPT_PROFILE", profile_override or "mini"),
         ("pcc_prompt_profile", "PCC_PROMPT_PROFILE", profile_override or "full"),
+        ("cloud_prompt_profile", "CLOUD_PROMPT_PROFILE", profile_override or "full"),
     ):
         profile = _env_str(env, env_name, default)
         if profile in PROFILES:
@@ -172,6 +192,12 @@ def load_config(
         (
             "pcc_context_token_budget",
             "PCC_CONTEXT_TOKEN_BUDGET",
+            "CONTEXT_TOKEN_BUDGET",
+            DEFAULT_PCC_CONTEXT_TOKEN_BUDGET,
+        ),
+        (
+            "cloud_context_token_budget",
+            "CLOUD_CONTEXT_TOKEN_BUDGET",
             "CONTEXT_TOKEN_BUDGET",
             DEFAULT_PCC_CONTEXT_TOKEN_BUDGET,
         ),
@@ -241,6 +267,7 @@ def load_config(
         values["llm_timeout"] = llm_timeout
 
     values["jobs_file"] = _env_str(env, "JOBS_FILE", "jobs.json")
+    values["notes_file"] = _env_str(env, "NOTES_FILE", "notes.json")
     values["log_dir"] = _env_str(env, "LOG_DIR", "logs")
 
     budget_fields: dict = {}
@@ -273,6 +300,15 @@ def load_config(
             "LOCAL_MODEL и PCC_MODEL должны различаться в hybrid режиме, "
             "иначе маршрутизация и fallback не имеют смысла"
         )
+
+    if values["model_mode"] == "cloud":
+        for key, env_name in (
+            ("cloud_base_url", "CLOUD_BASE_URL"),
+            ("cloud_api_key", "CLOUD_API_KEY"),
+            ("cloud_model", "CLOUD_MODEL"),
+        ):
+            if not values[key]:
+                problems.append(f"{env_name} обязателен в режиме cloud")
 
     if problems:
         raise ConfigError(problems)

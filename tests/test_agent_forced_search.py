@@ -165,6 +165,24 @@ class AgentForcedSearchTests(TestCase):
             "какая последняя версия gpt?",
         )
 
+    def test_local_memory_reference_does_not_force_web_search(self):
+        for phrase in (
+            "поищи в памяти",
+            "поищи в заметках",
+            "проверь в notes",
+            "загляни в мою память",
+            "поищи заметки про отпуск",
+        ):
+            self.assertIsNone(_forced_web_search_query(phrase), phrase)
+
+    def test_web_search_phrases_still_force_search(self):
+        for phrase in (
+            "поищи в сети",
+            "поищи последние новости",
+            "загугли это",
+        ):
+            self.assertIsNotNone(_forced_web_search_query(phrase), phrase)
+
     def test_forced_search_runs_before_model_and_cannot_repeat_in_same_turn(self):
         web = FakeWebSearchTool()
         agent = _agent(web)

@@ -22,8 +22,83 @@ class LoadConfigTests(TestCase):
 
     def test_invalid_model_mode_is_reported(self):
         with self.assertRaises(ConfigError) as caught:
-            load_config(env={"MODEL_MODE": "cloud"})
+            load_config(env={"MODEL_MODE": "banana"})
         self.assertTrue(any("MODEL_MODE" in problem for problem in caught.exception.problems))
+
+    def test_cloud_mode_requires_credentials(self):
+        with self.assertRaises(ConfigError) as caught:
+            load_config(env={"MODEL_MODE": "cloud"})
+        for env_name in ("CLOUD_BASE_URL", "CLOUD_API_KEY", "CLOUD_MODEL"):
+            self.assertTrue(
+                any(env_name in problem for problem in caught.exception.problems),
+                env_name,
+            )
+
+    def test_cloud_mode_valid_config(self):
+        config = load_config(
+            env={
+                "MODEL_MODE": "cloud",
+                "CLOUD_BASE_URL": "https://example.test/v1",
+                "CLOUD_API_KEY": "sk-test",
+                "CLOUD_MODEL": "qwen-plus",
+            }
+        )
+        self.assertEqual(config.model_mode, "cloud")
+        self.assertEqual(config.cloud_model, "qwen-plus")
+        self.assertEqual(config.cloud_prompt_profile.value, "full")
+        self.assertEqual(config.cloud_context_token_budget, 12000)
+
+    def test_cloud_prompt_profile_and_budget_overrides(self):
+        config = load_config(
+            env={
+                "MODEL_MODE": "cloud",
+                "CLOUD_BASE_URL": "https://example.test/v1",
+                "CLOUD_API_KEY": "sk-test",
+                "CLOUD_MODEL": "qwen-plus",
+                "CLOUD_PROMPT_PROFILE": "mini",
+                "CLOUD_CONTEXT_TOKEN_BUDGET": "8000",
+            }
+        )
+        self.assertEqual(config.cloud_prompt_profile.value, "mini")
+        self.assertEqual(config.cloud_context_token_budget, 8000)
+
+    def test_cloud_budget_uses_shared_fallback(self):
+        config = load_config(env={"CONTEXT_TOKEN_BUDGET": "4000"})
+        self.assertEqual(config.cloud_context_token_budget, 4000)
+
+    def test_stt_defaults_fall_back_to_cloud_credentials(self):
+        config = load_config(
+            env={
+                "CLOUD_BASE_URL": "https://api.groq.com/openai/v1",
+                "CLOUD_API_KEY": "gsk-test",
+            }
+        )
+        self.assertEqual(config.stt_base_url, "https://api.groq.com/openai/v1")
+        self.assertEqual(config.stt_api_key, "gsk-test")
+        self.assertEqual(config.stt_model, "whisper-large-v3-turbo")
+
+    def test_stt_overrides_take_precedence(self):
+        config = load_config(
+            env={
+                "CLOUD_BASE_URL": "https://api.groq.com/openai/v1",
+                "CLOUD_API_KEY": "gsk-test",
+                "STT_BASE_URL": "https://stt.example.test/v1",
+                "STT_API_KEY": "stt-key",
+                "STT_MODEL": "whisper-large-v3",
+            }
+        )
+        self.assertEqual(config.stt_base_url, "https://stt.example.test/v1")
+        self.assertEqual(config.stt_api_key, "stt-key")
+        self.assertEqual(config.stt_model, "whisper-large-v3")
+
+    def test_stt_is_disabled_without_credentials(self):
+        config = load_config(env={})
+        self.assertEqual(config.stt_api_key, "")
+        self.assertEqual(config.stt_base_url, "")
+
+    def test_notes_file_default_and_override(self):
+        self.assertEqual(load_config(env={}).notes_file, "notes.json")
+        self.assertEqual(load_config(env={"NOTES_FILE": "my.json"}).notes_file, "my.json")
 
     def test_invalid_number_is_reported(self):
         with self.assertRaises(ConfigError) as caught:
@@ -133,7 +208,7 @@ class LoadConfigTests(TestCase):
         with self.assertRaises(ConfigError) as caught:
             load_config(
                 env={
-                    "MODEL_MODE": "cloud",
+                    "MODEL_MODE": "banana",
                     "COMPACT_TRIGGER_RATIO": "2",
                     "RUN_MAX_STEPS": "-1",
                 }
@@ -142,7 +217,7 @@ class LoadConfigTests(TestCase):
 
     def test_config_error_message_lists_problems(self):
         with self.assertRaises(ConfigError) as caught:
-            load_config(env={"MODEL_MODE": "cloud"})
+            load_config(env={"MODEL_MODE": "banana"})
         self.assertIn("MODEL_MODE", str(caught.exception))
 
     def test_app_config_direct_construction(self):
